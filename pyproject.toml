@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heightmap-prep"
+version = "1.0.0"
+description = "Prepare ČÚZK DMR 5G terrain heightmaps for fast runtime sampling by geographic coordinates"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "affine>=2.4",
+    "numpy>=1.24",
+    "rasterio>=1.3",
+    "pyproj>=3.4",
+    "httpx>=0.24",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+heightmap-prep = "heightmap_prep.cli:main"
+heightmap-prep-world = "heightmap_prep.cli_world:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+# Some environments (e.g. a sourced ROS setup on PYTHONPATH) expose pytest
+# plugins that fail to import; none of them are needed here.
+addopts = "-p no:launch_ros -p no:launch_testing -p no:ament_lint -p no:ament_flake8 -p no:ament_pep257 -p no:ament_copyright -p no:ament_xmllint"

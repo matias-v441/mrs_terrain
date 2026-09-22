@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/
+
+# Local PROJ grid files (fetch with the commands in the README).
+.proj/
+
+# Local caches and generated datasets.
+cache/
+prepared/
+
+.map_cache/
+
+# Use leading underscores for private stuff
+_*/
+**/_*/
+_*
+**/_*
