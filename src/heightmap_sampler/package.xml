@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>heightmap_sampler</name>
+  <version>1.0.0</version>
+  <description>
+    Samples terrain heights by WGS84 latitude/longitude from a dataset prepared
+    by heightmap-prep. The C++ counterpart of examples/sampler.py.
+  </description>
+  <maintainer email="buninmatthew@gmail.com">Matvii Bunin</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_ros</buildtool_depend>
+
+  <depend>ament_index_cpp</depend>
+  <depend>geographic_msgs</depend>
+  <depend>heightmap_sampler_msgs</depend>
+  <depend>libgdal-dev</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
+  <depend>yaml-cpp</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -27,6 +27,10 @@ heightmap-prep-world = "heightmap_prep.cli_world:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+# src/ also holds the heightmap_sampler ROS 2 packages, which are not Python
+# packages. Without this they would be picked up as PEP 420 namespace packages
+# and shipped inside the wheel, GeoTIFF fixtures and all.
+namespaces = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

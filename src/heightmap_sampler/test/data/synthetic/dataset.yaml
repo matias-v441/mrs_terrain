@@ -1,0 +1,39 @@
+format_version: 1
+status: complete
+heightmap:
+  horizontal_crs: EPSG:5514
+  vertical_crs: EPSG:5773
+  vertical_datum: egm96
+  unit: m
+  dtype: float32
+  nodata: -9999.0
+grid:
+  resolution_x: 1.0
+  resolution_y: 1.0
+  tile_width_px: 32
+  tile_height_px: 32
+  origin_x: -765500.0
+  origin_y: -1121200.0
+  axis_order: east_north
+  tile_span_x: 32.0
+  tile_span_y: 32.0
+storage:
+  format: geotiff
+  compression: deflate
+  predictor: 3
+  block_width_px: 16
+  block_height_px: 16
+  tile_pattern: height/tile_{ix}_{iy}.tif
+sampling_contract:
+  query_crs: EPSG:4326
+  pixel_location: center
+  interpolation: bilinear
+tiles:
+  count: 3
+  index:
+  - - 0
+    - 0
+  - - 1
+    - 0
+  - - 0
+    - 1

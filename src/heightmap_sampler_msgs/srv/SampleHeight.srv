@@ -1,0 +1,21 @@
+# Sample prepared terrain heights at WGS84 coordinates.
+#
+# The request is batch-capable; a single query is a one-element array.
+# The altitude field of each point is ignored.
+geographic_msgs/GeoPoint[] points
+---
+# Parallel to the request points.
+#
+# Heights are in the dataset's stored vertical datum (EGM96 orthometric metres
+# for a dataset prepared with --vertical-datum egm96), already converted
+# offline -- no vertical transformation happens here.
+#
+# valid[i] is false when the covering tile is absent, the pixel is NoData, or
+# the point falls outside the raster; heights[i] is then NaN.
+float64[] heights
+bool[] valid
+
+# False only for a request-level failure (e.g. the sampler is unavailable).
+# A request whose points all fall outside the dataset still succeeds.
+bool success
+string message

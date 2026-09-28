@@ -225,6 +225,22 @@ Tiles carry no halo, so a sampler doing bilinear interpolation near a tile edge
 must load the neighbouring tile. `examples/sampler.py` is a ~100-line reference
 implementation of the whole runtime path.
 
+## Sampling from C++
+
+[`src/heightmap_sampler`](src/heightmap_sampler) is a ROS 2 Jazzy package that
+implements the same contract natively, for consumers that cannot call the
+Python reference:
+
+```cpp
+heightmap_sampler::HeightSampler sampler;   // no path from the caller
+auto height = sampler.sample(49.3625695, 14.2619165);
+```
+
+The prepared dataset is built into the package, so a caller supplies only a
+coordinate. It also ships a node exposing the sampler over a service. See
+[its README](src/heightmap_sampler/README.md) for how to point it at a dataset
+and how its results are checked against `examples/sampler.py`.
+
 ## Resume and atomicity
 
 Preparation is restartable. Each tile is written to `tile_<ix>_<iy>.tif.tmp`,
