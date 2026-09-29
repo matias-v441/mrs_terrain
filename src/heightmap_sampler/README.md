@@ -112,8 +112,10 @@ colcon test set:
 
 ```bash
 source <workspace>/install/setup.bash
-.venv/bin/python src/heightmap_sampler/test/parity_check.py ./prepared --outside
+.venv/bin/python src/heightmap_sampler/test/parity_check.py ./prepared
 ```
 
-It samples random coordinates with both this library and the Python reference
-and asserts they agree, on the heights and on which points have none.
+It first checks that both this library and the Python reference reproduce every
+reference height in the dataset's `test_points.csv` exactly. Then it samples
+random coordinates within `--radius` metres (default 100) of those points with
+both, and asserts they agree, on the heights and on which points have none.

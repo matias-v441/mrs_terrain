@@ -23,7 +23,6 @@ dev = ["pytest>=7.0"]
 
 [project.scripts]
 heightmap-prep = "heightmap_prep.cli:main"
-heightmap-prep-world = "heightmap_prep.cli_world:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

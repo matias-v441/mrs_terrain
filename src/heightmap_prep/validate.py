@@ -26,6 +26,7 @@ from .crs import (
 )
 from .errors import ValidationError
 from .manifest import FORMAT_VERSION, STATUS_COMPLETE, Manifest
+from .sampling import DatasetSampler, read_test_points
 from .tiling import TileGrid, TileIndex, parse_tile_filename
 
 log = logging.getLogger(__name__)
@@ -35,11 +36,11 @@ log = logging.getLogger(__name__)
 PLAUSIBLE_MIN_M = -100.0
 PLAUSIBLE_MAX_M = 2100.0
 
-#: Warn above this fraction of NoData in a tile that was expected to hold data.
-MAX_NODATA_FRACTION = 0.995
-
 #: Affine components must match the grid to this many metres.
 TRANSFORM_TOLERANCE_M = 1e-6
+
+#: A test point must re-sample to its recorded height within this many metres.
+TEST_POINT_TOLERANCE_M = 1e-6
 
 
 @dataclass
@@ -326,12 +327,13 @@ def _plausibility_checks(
 ) -> None:
     """Section 17.5 checks.  These only ever produce warnings."""
     name = facts.path.name
-    if facts.nodata_fraction >= MAX_NODATA_FRACTION:
-        report.warn(
-            f"tile {facts.tile} ({name}): {facts.nodata_fraction:.1%} NoData; "
-            "the tile may lie almost entirely outside source coverage"
-        )
+    # Tiles only hold the pixels around the safety areas, so being mostly NoData
+    # is normal; holding no data at all is not.
     if facts.valid_min is None:
+        report.warn(
+            f"tile {facts.tile} ({name}): no valid pixel at all; the source may "
+            "have no data there"
+        )
         return
     if facts.valid_min == 0.0 and facts.valid_max == 0.0:
         report.warn(f"tile {facts.tile} ({name}): every valid pixel is exactly 0.0")
@@ -443,6 +445,56 @@ def validate_vertical_transformation(
     return report
 
 
+# --- test points ---------------------------------------------------------
+
+
+def validate_test_points(
+    output_dir: Path, manifest: Manifest, report: ValidationReport | None = None
+) -> ValidationReport:
+    """Check that every test point re-samples from the tiles to its recorded height."""
+    report = report or ValidationReport()
+    relative = manifest.test_points_path
+    if relative is None:
+        report.warn("manifest declares no test points")
+        return report
+    if Path(relative).is_absolute() or ".." in Path(relative).parts:
+        report.error(
+            f"manifest test_points.path {relative!r} must be a relative path that "
+            "stays inside the dataset directory"
+        )
+        return report
+
+    path = Path(output_dir) / relative
+    if not path.is_file():
+        report.error(f"test points file {path} is missing")
+        return report
+    try:
+        points = read_test_points(path)
+    except ValidationError as exc:
+        report.error(str(exc))
+        return report
+    if len(points) != manifest.test_points_count:
+        report.error(
+            f"{path.name} holds {len(points)} point(s), manifest declares "
+            f"{manifest.test_points_count}"
+        )
+
+    with DatasetSampler(output_dir, manifest) as sampler:
+        for point in points:
+            height = sampler.sample(point.lon, point.lat)
+            if not math.isfinite(point.height) or not math.isfinite(height):
+                report.error(
+                    f"test point {point.lat}, {point.lon}: recorded height "
+                    f"{point.height!r}, the tiles give {height!r}"
+                )
+            elif abs(height - point.height) > TEST_POINT_TOLERANCE_M:
+                report.error(
+                    f"test point {point.lat}, {point.lon}: recorded height "
+                    f"{point.height!r} m, the tiles give {height!r} m"
+                )
+    return report
+
+
 # --- whole dataset -------------------------------------------------------
 
 
@@ -495,6 +547,7 @@ def validate_dataset(
             facts.append(tile_facts)
 
     validate_spatial_consistency(facts, manifest, report)
+    validate_test_points(output_dir, manifest, report)
 
     # Stray files usually mean an interrupted run or a stale manifest.
     declared = {manifest.tile_relative_path(tile) for tile in tiles}

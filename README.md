@@ -6,7 +6,9 @@ coordinates.
 The library acquires [ČÚZK DMR 5G](https://ags.cuzk.gov.cz/dmr/) elevation data
 in S-JTSK / Krovak East North (EPSG:5514), converts the source Bpv heights onto a
 requested output vertical datum using local PROJ grids, and writes deterministic
-tiled `float32` GeoTIFFs plus a `dataset.yaml` manifest.
+tiled `float32` GeoTIFFs plus a `dataset.yaml` manifest. What it prepares is
+driven by [MRS UAV system](https://github.com/ctu-mrs) world files: the tiles
+cover exactly what a sampler needs anywhere inside their safety areas.
 
 All the expensive work — HTTP acquisition and the spatially varying vertical
 datum conversion — happens once, offline. A runtime sampler then only has to
@@ -49,14 +51,16 @@ grids it used, along with their checksums.
 ## Usage
 
 ```bash
-heightmap-prep world1.yaml world2.yaml OUTPUT_DIR [OPTIONS]
+heightmap-prep world_a.yaml world_b.yaml OUTPUT_DIR [OPTIONS]
 heightmap-prep WORLDS_DIR OUTPUT_DIR [OPTIONS]
 ```
 
-The last positional argument is always the output directory.
+The last positional argument is always the output directory; the inputs are MRS
+world configs, or one directory of them.
 
 ```bash
-heightmap-prep examples/prague.yaml ./prepared --proj-data-dir ./.proj --cache-dir ./cache
+heightmap-prep worlds/world_bechovice.yaml worlds/world_ricany.yaml ./prepared \
+    --proj-data-dir ./.proj --cache-dir ./cache
 heightmap-prep ./worlds ./prepared --vertical-datum wgs84-ellipsoid --workers 4
 heightmap-prep ./prepared --validate-only
 ```
@@ -80,64 +84,51 @@ Advanced knobs (`--block-size`, `--nodata`, `--grid-origin`, `--max-request-px`,
 `--timeout`, `--retries`, `--cog`, `--no-plausibility-checks`) are listed by
 `heightmap-prep --help`.
 
-There is a second command, `heightmap-prep-world`, for deriving a world
-configuration from an MRS UAV system world file — see below.
-
 Exit codes: `0` success, `1` produced but failed validation, `2` the run could
 not proceed.
 
-### World configuration
+### World configs
+
+A world config is an MRS UAV system world file. Only its safety area is read:
 
 ```yaml
-name: prague
-
-bounds:
-  type: wgs84
-  west: 14.20
-  south: 49.95
-  east: 14.70
-  north: 50.25
-
-heightmap:
-  source: cuzk-dmr5g
-  resolution_m: 2.0
-
-rgb:
-  enabled: false
+mrs_uav_managers:
+  safety_area_manager:
+    safety_area:
+      horizontal:
+        frame_name: "latlon_origin"
+        points: [
+          50.0905258, 14.6327381,   # lat, lon of each vertex
+          50.0896023, 14.6330607,
+          50.0902173, 14.6348664,
+          50.0910495, 14.6346838,
+        ]
 ```
 
-`name` defaults to the filename and the `heightmap`/`rgb` sections are optional.
-Every world contributing to one dataset must agree on source and resolution,
-since a manifest describes a single grid.
+The world is named after its file, minus any `world_` prefix. Only a safety
+area in `latlon_origin` places the world on the map.
 
-### From an MRS world file
+A world config that cannot be prepared is skipped with a warning, and the run
+carries on with the rest. That covers a file that is missing or unreadable, a
+safety area that is absent, malformed or in another frame (`world_origin`,
+`local_origin`, ...), a world name already taken by an earlier config, a safety
+area reaching outside the source coverage, and a safety area corner where the
+source has no height. Any tiles only a skipped world needed are left out of the
+dataset. The run fails only when no world is left, or on problems that affect
+every world, such as the source service failing or PROJ grids missing.
 
-Sites are often already described by an [MRS UAV system](https://github.com/ctu-mrs)
-world file, whose safety area says where the vehicle may fly.
-`heightmap-prep-world` turns one into the world configuration that covers it:
+The dataset holds exactly the tiles a bilinear sampler reads when queried
+anywhere inside a safety area, border included, and no others:
 
-```bash
-heightmap-prep-world worlds/world_bechovice.yaml -o examples/bechovice.yaml
-heightmap-prep-world worlds/*.yaml -o generated/ --margin-m 250
-heightmap-prep generated/ ./prepared --proj-data-dir ./.proj
-```
+* a query interpolates between the four pixel centres around it, so the pixels
+  prepared are those around the safety area, with no further margin;
+* a tile is included only if the polygon itself comes within half a pixel of
+  it, so a diagonal safety area does not pull in tiles that merely share its
+  bounding box;
+* a safety area on or within half a pixel of a tile edge interpolates across
+  it, so the adjacent tile is included too.
 
-With no `--output` the configuration goes to stdout. The bounds are the WGS84
-bounding box of the safety area polygon grown by `--margin-m` (default 100 m) on
-every side, measured geodesically so the margin holds on all four edges;
-everything else uses the library defaults.
-
-Safety area points are read according to `frame_name`:
-
-| `frame_name` | Points are |
-| --- | --- |
-| `latlon_origin` | absolute `lat, lon` degrees |
-| `world_origin` | metres east/north of the world origin |
-| `local_origin`, `fcu*` | not georeferenced — rejected with an explanation |
-
-A `world_origin` in UTM records no zone, so one is assumed (`--utm-zone`,
-default `33N` for the Czech Republic) and the resolved origin is logged for you
-to check. A disabled safety area is still converted, with a warning.
+Within a tile only those pixels are fetched; the rest of the tile is NoData.
 
 ### Python API
 
@@ -154,7 +145,7 @@ options = PrepareOptions(
 )
 
 result = prepare_worlds(
-    inputs=[Path("world1.yaml"), Path("world2.yaml")],
+    inputs=[Path("worlds/world_bechovice.yaml"), Path("worlds/world_ricany.yaml")],
     output_dir=Path("./prepared"),
     options=options,
 )
@@ -168,12 +159,37 @@ print(result.manifest.tiles, result.report.ok)
 ```
 OUTPUT_DIR/
     dataset.yaml
+    test_points.csv
     height/
         tile_<ix>_<iy>.tif
 ```
 
 Tiles are single-band `float32`, `deflate`-compressed with `predictor=3`,
 internally tiled at 256×256, with NoData `-9999.0`.
+
+### Test points
+
+`test_points.csv` is reference data for checking a sampler. It has one row per
+safety area corner, with no header:
+
+```
+50.0905258,14.6327381,259.03327503733396
+```
+
+The columns are latitude, longitude and the height the dataset gives there,
+interpolated from the prepared tiles as the sampling contract below prescribes,
+on the manifest's vertical datum. A sampler that implements the contract
+reproduces every row to within float rounding. The manifest names the file:
+
+```yaml
+test_points:
+  path: test_points.csv
+  count: 12
+  columns: [lat, lon, height]
+```
+
+Every corner has a height: a world with a corner where the source has no data
+is skipped, as described under [World configs](#world-configs).
 
 ### Tile indexing
 
@@ -264,12 +280,14 @@ Nothing is published before it has been checked:
   grid, dimensions, `float32`, NoData matches, all non-NoData values finite;
 * **spatial consistency** — neighbouring tiles share a resolution and abut
   exactly, with no gap or overlap;
+* **test points** — every row of `test_points.csv` re-samples from the tiles to
+  its recorded height;
 * **vertical transformation** — reference points are pushed through the real
   transformer before any raster work; `inf`, `nan`, unavailable and
   ballpark-only operations are rejected;
-* **plausibility** — elevations outside the Czech range, all-zero tiles,
-  excessive NoData and a suspiciously unchanged conversion produce *warnings*
-  only, and never replace the CRS-level checks.
+* **plausibility** — elevations outside the Czech range, all-zero tiles, tiles
+  with no data at all and a suspiciously unchanged conversion produce
+  *warnings* only, and never replace the CRS-level checks.
 
 ## Coordinate reference systems
 

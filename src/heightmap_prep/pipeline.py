@@ -3,11 +3,17 @@
 This is the orchestration layer that ties acquisition (:mod:`.cuzk`), vertical
 conversion (:mod:`.crs`, :mod:`.raster`), the global tile grid (:mod:`.tiling`),
 the manifest (:mod:`.manifest`) and validation (:mod:`.validate`) together.
+
+The dataset holds exactly the tiles a bilinear sampler reads when queried
+anywhere inside the worlds' safety areas, borders included.  A world config that
+cannot be prepared is skipped with a warning; only problems that affect every
+world, such as a failing source or missing PROJ grids, stop the run.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -24,7 +30,6 @@ from .config import (
     WorldConfig,
     align_origin,
     load_worlds,
-    resolve_dataset_settings,
 )
 from .crs import (
     SOURCE_HORIZONTAL_CRS,
@@ -34,15 +39,17 @@ from .crs import (
     VerticalConverter,
     VerticalOperation,
     build_converter,
-    wgs84_bounds_to_projected,
+    project_points,
 )
 from .cuzk import CuzkDmr5Source
 from .errors import (
     ConfigError,
+    HeightmapPrepError,
     OutOfCoverageError,
     OutputConflictError,
     SourceError,
     UnexpectedVerticalDatumError,
+    ValidationError,
 )
 from .manifest import (
     MANIFEST_FILENAME,
@@ -63,8 +70,15 @@ from .raster import (
     read_tags,
     write_raster_atomic,
 )
+from .sampling import TEST_POINTS_FILENAME, DatasetSampler, ReferencePoint, write_test_points
 from .sources import BaseHeightSource
-from .tiling import ProjectedBounds, TileGrid, TileIndex
+from .tiling import (
+    PixelRange,
+    ProjectedBounds,
+    TileGrid,
+    TileIndex,
+    polygon_intersects_bounds,
+)
 from .validate import ValidationReport, validate_dataset, validate_tile, validate_vertical_transformation
 
 log = logging.getLogger(__name__)
@@ -75,7 +89,8 @@ class WorldPlan:
     """A world's footprint on the global tile grid."""
 
     world: WorldConfig
-    projected_bounds: ProjectedBounds
+    #: Every pixel a sampler may read for a query inside the safety area.
+    pixels: PixelRange
     tiles: list[TileIndex]
 
 
@@ -84,11 +99,10 @@ class TileOutcome:
     """What happened to one tile during a run."""
 
     tile: TileIndex
-    action: str  # "written" | "reused" | "skipped"
+    action: str  # "written" | "reused"
     path: Path | None = None
     stats: ConversionStats | None = None
     duration_s: float = 0.0
-    reason: str = ""
 
 
 @dataclass
@@ -102,6 +116,9 @@ class PrepareResult:
     plans: list[WorldPlan] = field(default_factory=list)
     outcomes: list[TileOutcome] = field(default_factory=list)
     report: ValidationReport = field(default_factory=ValidationReport)
+    test_points: list[ReferencePoint] = field(default_factory=list)
+    #: Each world config that was skipped, and why.
+    skipped: dict[Path, str] = field(default_factory=dict)
 
     @property
     def tiles_written(self) -> list[TileIndex]:
@@ -111,10 +128,6 @@ class PrepareResult:
     def tiles_reused(self) -> list[TileIndex]:
         return [o.tile for o in self.outcomes if o.action == "reused"]
 
-    @property
-    def tiles_skipped(self) -> list[TileIndex]:
-        return [o.tile for o in self.outcomes if o.action == "skipped"]
-
 
 # --- planning ------------------------------------------------------------
 
@@ -122,58 +135,53 @@ class PrepareResult:
 def plan_world(
     world: WorldConfig, grid: TileGrid, coverage: ProjectedBounds | None
 ) -> WorldPlan:
-    """Project a world's WGS84 box and list the tiles it touches."""
-    bounds_tuple = wgs84_bounds_to_projected(
-        world.bounds.west,
-        world.bounds.south,
-        world.bounds.east,
-        world.bounds.north,
-        target_epsg=5514,
+    """Find the pixels and tiles a sampler reads anywhere in ``world``'s safety area.
+
+    The pixels are those around the safety area's bounding box.  A tile is only
+    needed when the polygon itself reaches the tile's sampling region, so a
+    diagonal safety area does not pull in tiles that merely share its box.
+    """
+    xs, ys = project_points(
+        [lon for lon, _ in world.points], [lat for _, lat in world.points], target_epsg=5514
     )
-    projected = ProjectedBounds(*bounds_tuple)
+    pixels = grid.sampling_pixels(xs, ys)
+    needed = grid.pixels_bounds(pixels)
+    if coverage is not None and not coverage.contains(needed):
+        raise OutOfCoverageError(
+            f"world {world.describe()}: the safety area needs EPSG:5514 extent "
+            f"{tuple(round(v, 1) for v in needed.as_tuple())}, which is not inside the "
+            f"source coverage {coverage.as_tuple()}"
+        )
+    tiles = [
+        tile
+        for tile in grid.tiles_for_pixels(pixels)
+        if polygon_intersects_bounds(xs, ys, grid.sampling_region(tile))
+    ]
     log.debug(
-        "world %s: WGS84 %s -> EPSG:5514 %s",
+        "world %s: EPSG:5514 extent %s, pixels %s",
         world.name,
-        (world.bounds.west, world.bounds.south, world.bounds.east, world.bounds.north),
-        projected.as_tuple(),
+        tuple(round(v, 3) for v in needed.as_tuple()),
+        pixels,
     )
-
-    if coverage is not None:
-        clipped = coverage.intersection(projected)
-        if clipped is None:
-            raise OutOfCoverageError(
-                f"world {world.describe()}: requested area "
-                f"{projected.as_tuple()} (EPSG:5514) does not intersect the source "
-                f"coverage {coverage.as_tuple()}"
-            )
-        if clipped.as_tuple() != projected.as_tuple():
-            log.warning(
-                "world %s: requested area is partly outside source coverage; "
-                "clipping to %s",
-                world.name,
-                clipped.as_tuple(),
-            )
-        projected = clipped
-
-    return WorldPlan(world=world, projected_bounds=projected, tiles=grid.tiles_for_bounds(projected))
+    return WorldPlan(world=world, pixels=pixels, tiles=tiles)
 
 
-def merge_tile_requirements(plans: Sequence[WorldPlan], grid: TileGrid) -> dict[TileIndex, ProjectedBounds]:
-    """For each tile, the area that actually has to be fetched.
+def merge_tile_requirements(
+    plans: Sequence[WorldPlan], grid: TileGrid
+) -> dict[TileIndex, PixelRange]:
+    """For each tile, the pixels that actually have to be fetched.
 
     Worlds rarely fill a whole tile, so only the union of the requesting worlds'
-    footprints inside that tile is acquired; the rest of the tile stays NoData.
+    pixels inside that tile is acquired; the rest of the tile stays NoData.
     Fetching the union rather than each world separately means overlapping worlds
     share one request.
     """
-    required: dict[TileIndex, ProjectedBounds] = {}
+    required: dict[TileIndex, PixelRange] = {}
     for plan in plans:
         for tile in plan.tiles:
-            overlap = grid.tile_bounds(tile).intersection(plan.projected_bounds)
-            if overlap is None:
-                continue
+            inside = plan.pixels.intersection(grid.tile_pixels(tile))
             previous = required.get(tile)
-            required[tile] = overlap if previous is None else previous.union(overlap)
+            required[tile] = inside if previous is None else previous.union(inside)
     # Reading order, so a run's tile order never depends on the worker count.
     return dict(sorted(required.items(), key=lambda item: (item[0].iy, item[0].ix)))
 
@@ -243,7 +251,7 @@ class _TileBuilder:
 
     # --- build -----------------------------------------------------------
 
-    def build(self, tile: TileIndex, required: ProjectedBounds) -> TileOutcome:
+    def build(self, tile: TileIndex, pixels: PixelRange) -> TileOutcome:
         started = time.monotonic()
         path = self.manifest.tile_path(self.output_dir, tile)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -260,17 +268,8 @@ class _TileBuilder:
                 )
             log.debug("tile %s: regenerating (%s)", tile, reason or "overwrite requested")
 
-        window = self.grid.pixel_window_for_bounds(tile, required)
-        if window is None:  # pragma: no cover - merge_tile_requirements excludes these
-            return TileOutcome(tile, "skipped", reason="no overlap with requested area")
-
-        coverage = self.source.coverage()
-        fetch_bounds = self.grid.window_bounds(tile, window)
-        if coverage is not None and coverage.intersection(fetch_bounds) is None:
-            log.info("tile %s: entirely outside source coverage, skipping", tile)
-            return TileOutcome(tile, "skipped", reason="outside source coverage")
-
-        col_off, row_off, width, height = window
+        col_off, row_off, width, height = self.grid.tile_window(tile, pixels)
+        fetch_bounds = self.grid.pixels_bounds(pixels)
         transform = self.grid.tile_transform(tile)
 
         try:
@@ -358,16 +357,9 @@ class _TileBuilder:
 # --- entry points --------------------------------------------------------
 
 
-def _build_source(
-    source_id: str, resolution_m: float, options: PrepareOptions
-) -> BaseHeightSource:
-    if source_id != "cuzk-dmr5g":
-        raise ConfigError(
-            f"unsupported heightmap source {source_id!r}; "
-            "version 1 implements 'cuzk-dmr5g'"
-        )
+def _build_source(options: PrepareOptions) -> BaseHeightSource:
     return CuzkDmr5Source(
-        resolution_m=resolution_m,
+        resolution_m=options.resolution_m,
         nodata=options.nodata,
         timeout_s=options.request_timeout_s,
         retries=options.request_retries,
@@ -417,7 +409,6 @@ def _build_manifest(
     source: BaseHeightSource,
     operation: VerticalOperation,
     options: PrepareOptions,
-    dataset_bounds: ProjectedBounds | None,
 ) -> Manifest:
     """Describe the dataset this run is about to produce.
 
@@ -459,16 +450,6 @@ def _build_manifest(
         proj_grids=list(operation.grid_names),
         proj_grid_checksums=checksums,
         worlds=[world.name for world in worlds],
-        world_bounds_wgs84={
-            world.name: [
-                world.bounds.west,
-                world.bounds.south,
-                world.bounds.east,
-                world.bounds.north,
-            ]
-            for world in worlds
-        },
-        dataset_bounds=list(dataset_bounds.as_tuple()) if dataset_bounds else None,
         software=software_versions(__version__),
         interpolation=getattr(source, "interpolation", "nearest"),
         processing_version=PROCESSING_VERSION,
@@ -506,6 +487,57 @@ def _clean_stale_temporaries(output_dir: Path, manifest: Manifest) -> None:
         leftover.unlink(missing_ok=True)
 
 
+def _skip(skipped: dict[Path, str], world: WorldConfig, reason: str) -> None:
+    log.warning("skipping world config: %s", reason)
+    skipped[world.path or Path(world.name)] = reason
+
+
+def _corner_heights(
+    output_dir: Path, manifest: Manifest, worlds: Sequence[WorldConfig]
+) -> dict[tuple[float, float], float]:
+    """The height at every safety area corner, keyed by ``(lat, lon)``; NaN where none."""
+    heights: dict[tuple[float, float], float] = {}
+    with DatasetSampler(output_dir, manifest) as sampler:
+        for world in worlds:
+            for lon, lat in world.points:
+                if (lat, lon) not in heights:
+                    heights[(lat, lon)] = sampler.sample(lon, lat)
+    return heights
+
+
+def _discard_unneeded_tiles(
+    output_dir: Path, manifest: Manifest, plans: Sequence[WorldPlan]
+) -> None:
+    """Remove the tiles that only skipped worlds needed."""
+    needed = {tile for plan in plans for tile in plan.tiles}
+    for tile in manifest.tiles:
+        if tile not in needed:
+            manifest.tile_path(output_dir, tile).unlink(missing_ok=True)
+            log.info("removed tile %s, which only skipped worlds needed", tile)
+    manifest.set_tiles(list(needed))
+
+
+def _write_test_points(
+    output_dir: Path,
+    manifest: Manifest,
+    worlds: Sequence[WorldConfig],
+    heights: dict[tuple[float, float], float],
+) -> list[ReferencePoint]:
+    """Write the height at every safety area corner to the test points file."""
+    points: list[ReferencePoint] = []
+    seen: set[tuple[float, float]] = set()
+    for world in worlds:
+        for lon, lat in world.points:
+            if (lat, lon) not in seen:
+                seen.add((lat, lon))
+                points.append(ReferencePoint(lat=lat, lon=lon, height=heights[(lat, lon)]))
+
+    write_test_points(Path(output_dir) / TEST_POINTS_FILENAME, points)
+    manifest.test_points_path = TEST_POINTS_FILENAME
+    manifest.test_points_count = len(points)
+    return points
+
+
 def prepare_worlds(
     inputs: Sequence[Path],
     output_dir: Path,
@@ -513,7 +545,7 @@ def prepare_worlds(
     *,
     source: BaseHeightSource | None = None,
 ) -> PrepareResult:
-    """Prepare every world in ``inputs`` into a dataset under ``output_dir``.
+    """Prepare every world config in ``inputs`` into a dataset under ``output_dir``.
 
     ``source`` may be supplied to substitute the acquisition backend (used by
     the tests and by future adapters); by default the ČÚZK DMR 5G ImageServer is
@@ -522,8 +554,12 @@ def prepare_worlds(
     options = options or PrepareOptions()
     output_dir = Path(output_dir)
 
-    worlds = load_worlds([Path(p) for p in inputs])
-    source_id, resolution_m = resolve_dataset_settings(worlds, options)
+    worlds, skipped = load_worlds([Path(p) for p in inputs])
+    if not worlds:
+        raise ConfigError(
+            f"none of the {len(skipped)} world config(s) could be used; nothing to prepare"
+        )
+    resolution_m = options.resolution_m
     log.info(
         "preparing %d world(s) at %g m onto the %s vertical datum: %s",
         len(worlds),
@@ -548,7 +584,7 @@ def prepare_worlds(
         log.warning("%s", warning)
 
     owned_source = source is None
-    height_source = source or _build_source(source_id, resolution_m, options)
+    height_source = source or _build_source(options)
 
     try:
         if height_source.vertical_crs != SOURCE_VERTICAL_CRS:
@@ -583,21 +619,26 @@ def prepare_worlds(
         )
 
         coverage = height_source.coverage()
-        plans = [plan_world(world, grid, coverage) for world in worlds]
+        plans: list[WorldPlan] = []
+        for world in worlds:
+            try:
+                plans.append(plan_world(world, grid, coverage))
+            except HeightmapPrepError as exc:
+                _skip(skipped, world, str(exc))
+        if not plans:
+            raise ConfigError(
+                "no world config's safety area can be prepared from the source; "
+                "nothing to prepare"
+            )
+        worlds = [plan.world for plan in plans]
         required = merge_tile_requirements(plans, grid)
 
-        dataset_bounds: ProjectedBounds | None = None
         for plan in plans:
             log.info(
-                "world %s: EPSG:5514 bounds %s -> %d tile(s)",
+                "world %s: %d-vertex safety area -> tile(s) %s",
                 plan.world.name,
-                tuple(round(v, 1) for v in plan.projected_bounds.as_tuple()),
-                len(plan.tiles),
-            )
-            dataset_bounds = (
-                plan.projected_bounds
-                if dataset_bounds is None
-                else dataset_bounds.union(plan.projected_bounds)
+                len(plan.world.points),
+                ", ".join(str(tile) for tile in plan.tiles),
             )
 
         manifest = _build_manifest(
@@ -606,7 +647,6 @@ def prepare_worlds(
             source=height_source,
             operation=operation,
             options=options,
-            dataset_bounds=dataset_bounds,
         )
         manifest.set_tiles(list(required))
 
@@ -640,11 +680,7 @@ def prepare_worlds(
             raise
 
         written = sum(1 for o in outcomes if o.action == "written")
-        reused = sum(1 for o in outcomes if o.action == "reused")
-        skipped = [o for o in outcomes if o.action == "skipped"]
-        log.info(
-            "tiles: %d written, %d reused, %d skipped", written, reused, len(skipped)
-        )
+        log.info("tiles: %d written, %d reused", written, len(outcomes) - written)
         cache_hits = getattr(height_source, "cache_hits", None)
         if cache_hits is not None:
             log.info(
@@ -653,19 +689,46 @@ def prepare_worlds(
                 cache_hits,
             )
 
-        # Tiles that turned out to be entirely outside coverage are not part of
-        # the dataset, so the manifest must not promise them.
-        if skipped:
-            manifest.set_tiles(
-                [o.tile for o in outcomes if o.action in ("written", "reused")]
+        # Every point of a safety area must be samplable, so a world with a corner
+        # the source has no height for cannot be part of the dataset.
+        heights = _corner_heights(output_dir, manifest, worlds)
+        kept: list[WorldPlan] = []
+        for plan in plans:
+            missing = [
+                f"{lat}, {lon}"
+                for lon, lat in plan.world.points
+                if not math.isfinite(heights[(lat, lon)])
+            ]
+            if missing:
+                _skip(
+                    skipped,
+                    plan.world,
+                    f"world {plan.world.describe()}: the source has no height around "
+                    f"safety area corner(s) {'; '.join(missing)}",
+                )
+            else:
+                kept.append(plan)
+        if not kept:
+            raise ValidationError(
+                "the source has no height around the safety area corners of any world; "
+                "nothing to publish"
             )
+        if len(kept) < len(plans):
+            plans = kept
+            worlds = [plan.world for plan in plans]
+            manifest.worlds = [world.name for world in worlds]
+            _discard_unneeded_tiles(output_dir, manifest, plans)
+            remaining = set(manifest.tiles)
+            outcomes = [o for o in outcomes if o.tile in remaining]
+
+        test_points = _write_test_points(output_dir, manifest, worlds, heights)
+        manifest.write(output_dir)
+        log.info(
+            "wrote %d test point(s) to %s", len(test_points), output_dir / TEST_POINTS_FILENAME
+        )
 
         if options.validate_tiles:
-            report = validate_dataset(
-                output_dir,
-                plausibility=options.plausibility_checks,
-                expected_tiles=manifest.tiles,
-            )
+            report = validate_dataset(output_dir, plausibility=options.plausibility_checks)
         else:
             report = ValidationReport()
         report.log()
@@ -683,6 +746,8 @@ def prepare_worlds(
             plans=plans,
             outcomes=outcomes,
             report=report,
+            test_points=test_points,
+            skipped=skipped,
         )
     finally:
         if owned_source:
@@ -693,17 +758,17 @@ def prepare_worlds(
 
 def _run_builder(
     builder: _TileBuilder,
-    required: dict[TileIndex, ProjectedBounds],
+    required: dict[TileIndex, PixelRange],
     workers: int,
 ) -> list[TileOutcome]:
     """Build every required tile, optionally across a bounded thread pool."""
     items = list(required.items())
     if workers <= 1 or len(items) <= 1:
-        return [builder.build(tile, bounds) for tile, bounds in items]
+        return [builder.build(tile, pixels) for tile, pixels in items]
 
     outcomes: list[TileOutcome] = []
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tile") as pool:
-        futures = {pool.submit(builder.build, tile, bounds): tile for tile, bounds in items}
+        futures = {pool.submit(builder.build, tile, pixels): tile for tile, pixels in items}
         try:
             for future in as_completed(futures):
                 outcomes.append(future.result())

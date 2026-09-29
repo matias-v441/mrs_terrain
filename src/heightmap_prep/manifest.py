@@ -30,6 +30,9 @@ STATUS_COMPLETE = "complete"
 
 DEFAULT_TILE_PATTERN = "height/tile_{ix}_{iy}.tif"
 
+#: Column order of the test points file, which has no header row.
+TEST_POINT_COLUMNS = ("lat", "lon", "height")
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -116,9 +119,11 @@ class Manifest:
     status: str = STATUS_BUILDING
     format_version: int = FORMAT_VERSION
     worlds: list[str] = field(default_factory=list)
-    world_bounds_wgs84: dict[str, list[float]] = field(default_factory=dict)
     tiles: list[TileIndex] = field(default_factory=list)
-    dataset_bounds: list[float] | None = None
+    #: ``lat,lon,height`` reference samples at every safety area corner,
+    #: relative to the dataset directory.
+    test_points_path: str | None = None
+    test_points_count: int = 0
 
     # reproducibility
     software: dict[str, str] = field(default_factory=dict)
@@ -236,12 +241,11 @@ class Manifest:
         }
         if self.source_service_url:
             document["source"]["service_url"] = self.source_service_url
-        if self.dataset_bounds is not None:
-            document["grid"]["dataset_bounds"] = [float(v) for v in self.dataset_bounds]
-        if self.world_bounds_wgs84:
-            document["world_bounds_wgs84"] = {
-                name: [float(v) for v in bounds]
-                for name, bounds in self.world_bounds_wgs84.items()
+        if self.test_points_path is not None:
+            document["test_points"] = {
+                "path": self.test_points_path,
+                "count": int(self.test_points_count),
+                "columns": list(TEST_POINT_COLUMNS),
             }
         return document
 
@@ -266,6 +270,9 @@ class Manifest:
         vertical = (transform.get("vertical") or {}) if isinstance(transform, dict) else {}
         processing = document.get("processing") or {}
         tiles_section = document.get("tiles") or {}
+        test_points = document.get("test_points") or {}
+        if not isinstance(test_points, dict):
+            raise ValidationError(f"{origin}: section 'test_points' must be a mapping")
 
         def need(mapping: dict[str, Any], key: str, where: str) -> Any:
             if key not in mapping or mapping[key] is None:
@@ -294,11 +301,6 @@ class Manifest:
             origin_x=float(need(grid, "origin_x", "grid")),
             origin_y=float(need(grid, "origin_y", "grid")),
             axis_order=str(grid.get("axis_order", "east_north")),
-            dataset_bounds=(
-                [float(v) for v in grid["dataset_bounds"]]
-                if isinstance(grid.get("dataset_bounds"), (list, tuple))
-                else None
-            ),
             storage_format=str(storage.get("format", "geotiff")),
             compression=str(storage.get("compression", "deflate")),
             predictor=int(storage.get("predictor", 3)),
@@ -324,11 +326,11 @@ class Manifest:
             proj_grids=list(vertical.get("proj_grids", []) or []),
             proj_grid_checksums=dict(vertical.get("proj_grid_checksums", {}) or {}),
             worlds=[str(w) for w in (document.get("worlds") or [])],
-            world_bounds_wgs84={
-                str(k): [float(v) for v in values]
-                for k, values in (document.get("world_bounds_wgs84") or {}).items()
-            },
             tiles=tiles,
+            test_points_path=(
+                str(test_points["path"]) if test_points.get("path") is not None else None
+            ),
+            test_points_count=int(test_points.get("count", 0) or 0),
             software=dict(document.get("software") or {}),
             created_utc=str(processing.get("created_utc", _utc_now())),
             updated_utc=str(processing.get("updated_utc", _utc_now())),

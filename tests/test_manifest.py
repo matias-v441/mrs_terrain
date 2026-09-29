@@ -90,6 +90,27 @@ def test_round_trip_through_yaml(tmp_path: Path) -> None:
     assert restored.to_dict() == original.to_dict()
 
 
+def test_test_points_round_trip(tmp_path: Path) -> None:
+    original = sample()
+    assert "test_points" not in original.to_dict()
+    original.test_points_path = "test_points.csv"
+    original.test_points_count = 12
+    assert original.to_dict()["test_points"] == {
+        "path": "test_points.csv",
+        "count": 12,
+        "columns": ["lat", "lon", "height"],
+    }
+    original.write(tmp_path)
+    restored = Manifest.read(tmp_path)
+    assert (restored.test_points_path, restored.test_points_count) == ("test_points.csv", 12)
+
+
+def test_the_manifest_has_no_bounds() -> None:
+    document = sample().to_dict()
+    assert "world_bounds_wgs84" not in document
+    assert "dataset_bounds" not in document["grid"]
+
+
 def test_write_is_atomic_and_leaves_no_temporary(tmp_path: Path) -> None:
     path = sample().write(tmp_path)
     assert path.name == MANIFEST_FILENAME

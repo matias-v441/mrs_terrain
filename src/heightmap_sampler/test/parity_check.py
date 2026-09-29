@@ -9,9 +9,11 @@ the project's Python environment.
     source <workspace>/install/setup.bash
     .venv/bin/python src/heightmap_sampler/test/parity_check.py ./prepared
 
-Points are drawn from the dataset's own world bounds, so most of them land on
-real data; add --outside to also probe beyond the prepared area, where both
-implementations must agree that there is no height.
+First, every point in the dataset's test points file (the safety area corners,
+with the heights heightmap-prep sampled there) must come out of both samplers
+with exactly the recorded height.  Then random points are drawn within
+--radius metres of randomly chosen test points, so they land both on and off
+the prepared data; where there is none, both implementations must agree on that.
 """
 
 from __future__ import annotations
@@ -44,16 +46,14 @@ def cpp_sample(executable: list[str], dataset: Path, lon: float, lat: float) -> 
     return float(result.stdout.splitlines()[0])
 
 
-def query_bounds(dataset: Path) -> tuple[float, float, float, float]:
+def test_points(dataset: Path) -> list[tuple[float, float, float]]:
+    """The dataset's ``(lat, lon, height)`` reference points."""
     manifest = yaml.safe_load((dataset / "dataset.yaml").read_text(encoding="utf-8"))
-    worlds = manifest.get("world_bounds_wgs84") or {}
-    if not worlds:
-        raise SystemExit(f"{dataset}/dataset.yaml has no world_bounds_wgs84 to sample within")
-    west = min(b[0] for b in worlds.values())
-    south = min(b[1] for b in worlds.values())
-    east = max(b[2] for b in worlds.values())
-    north = max(b[3] for b in worlds.values())
-    return west, south, east, north
+    entry = manifest.get("test_points") or {}
+    if not entry.get("path"):
+        raise SystemExit(f"{dataset}/dataset.yaml declares no test points")
+    rows = (dataset / entry["path"]).read_text(encoding="utf-8").split()
+    return [tuple(float(v) for v in row.split(",")) for row in rows]
 
 
 def main() -> int:
@@ -63,9 +63,10 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tolerance", type=float, default=1e-6)
     parser.add_argument(
-        "--outside",
-        action="store_true",
-        help="grow the sampled area so that points fall outside the prepared data too",
+        "--radius",
+        type=float,
+        default=100.0,
+        help="how far from a test point random points may fall, in metres (default: 100)",
     )
     parser.add_argument(
         "--executable",
@@ -77,22 +78,31 @@ def main() -> int:
     dataset = args.dataset.resolve()
     executable = args.executable.split()
 
-    west, south, east, north = query_bounds(dataset)
-    if args.outside:
-        margin_x = (east - west) * 0.5
-        margin_y = (north - south) * 0.5
-        west, east = west - margin_x, east + margin_x
-        south, north = south - margin_y, north + margin_y
-
+    points = test_points(dataset)
     reference = HeightSampler(dataset)
-    rng = random.Random(args.seed)
 
     mismatches = 0
+    for lat, lon, height in points:
+        expected = reference.sample(lon, lat)
+        actual = cpp_sample(executable, dataset, lon, lat)
+        if expected != height or not abs(actual - height) <= args.tolerance:
+            print(
+                f"MISMATCH test point {lat!r}, {lon!r}: file={height!r} "
+                f"python={expected!r} cpp={actual!r}"
+            )
+            mismatches += 1
+
+    rng = random.Random(args.seed)
+    metres_per_degree = 111_320.0
+
     both_missing = 0
     worst = 0.0
     for _ in range(args.points):
-        lon = rng.uniform(west, east)
-        lat = rng.uniform(south, north)
+        centre_lat, centre_lon, _ = rng.choice(points)
+        dlat = args.radius / metres_per_degree
+        dlon = dlat / math.cos(math.radians(centre_lat))
+        lat = centre_lat + rng.uniform(-dlat, dlat)
+        lon = centre_lon + rng.uniform(-dlon, dlon)
 
         expected = reference.sample(lon, lat)
         actual = cpp_sample(executable, dataset, lon, lat)
@@ -115,8 +125,9 @@ def main() -> int:
 
     sampled = args.points - both_missing
     print(
-        f"{args.points} points: {sampled} with data, {both_missing} with none in both, "
-        f"worst difference {worst:.3e} m, {mismatches} mismatches"
+        f"{len(points)} test points and {args.points} random points: {sampled} random "
+        f"with data, {both_missing} with none in both, worst difference {worst:.3e} m, "
+        f"{mismatches} mismatches"
     )
     return 1 if mismatches else 0
 

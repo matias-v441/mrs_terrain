@@ -2,8 +2,11 @@
 
 ::
 
-    heightmap-prep world1.yaml world2.yaml OUTPUT_DIR [OPTIONS]
+    heightmap-prep world_a.yaml world_b.yaml OUTPUT_DIR [OPTIONS]
     heightmap-prep WORLDS_DIR OUTPUT_DIR [OPTIONS]
+
+World configs are MRS UAV system world files; the dataset covers their safety
+areas.
 """
 
 from __future__ import annotations
@@ -30,12 +33,18 @@ LOG_LEVELS = {
 
 EPILOG = """\
 examples:
-  heightmap-prep prague.yaml brno.yaml ./prepared --proj-data-dir ./.proj
+  heightmap-prep worlds/world_bechovice.yaml worlds/world_ricany.yaml ./prepared \
+      --proj-data-dir ./.proj
   heightmap-prep ./worlds ./prepared --vertical-datum wgs84-ellipsoid
-  heightmap-prep ./worlds ./prepared --validate-only
+  heightmap-prep ./prepared --validate-only
 
 The last positional argument is always the output directory.  Preceding
-arguments are either one worlds directory or a list of world YAML files.
+arguments are either one worlds directory or a list of MRS world config files.
+The prepared tiles cover every point of each world's safety area, which must be
+given in latlon_origin.  A world config that cannot be prepared -- unreadable,
+no latlon_origin safety area, outside the source coverage, no source data at a
+safety area corner -- is skipped with a warning.  test_points.csv in the output holds the height at every safety area
+corner, as lat,lon,height rows, for checking samplers against.
 
 exit codes:
   0  success
@@ -51,7 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Prepare ČÚZK DMR 5G heightmaps for a WGS84 lon/lat runtime sampler: "
             "acquire in EPSG:5514, convert Bpv heights onto the requested vertical "
-            "datum, and write deterministic tiled float32 GeoTIFFs with a manifest."
+            "datum, and write deterministic tiled float32 GeoTIFFs covering the "
+            "safety areas of MRS world configs, with a manifest."
         ),
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -60,7 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
         "paths",
         nargs="+",
         metavar="INPUT... OUTPUT_DIR",
-        help="one worlds directory or several world YAML files, then the output directory",
+        help="one worlds directory or several MRS world config files, then the "
+        "output directory",
     )
     parser.add_argument(
         "--vertical-datum",
@@ -272,6 +283,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         len(result.worlds),
         result.output_dir.resolve(),
     )
+    if result.skipped:
+        log.warning(
+            "skipped %d world config(s), see the warnings above: %s",
+            len(result.skipped),
+            ", ".join(path.name for path in result.skipped),
+        )
     return 0 if result.report.ok else 1
 
 

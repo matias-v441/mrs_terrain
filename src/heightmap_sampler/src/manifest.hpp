@@ -3,8 +3,8 @@
 //
 // Only the keys a sampler actually needs are required.  Everything under
 // source/, transform/, sampling_contract/, software/ and processing/ is
-// provenance and is deliberately ignored, as are the optional
-// grid.dataset_bounds and world_bounds_wgs84.
+// provenance and is deliberately ignored, as is test_points (reference
+// heights for checking samplers, see test/parity_check.py).
 
 #ifndef MANIFEST_HPP_
 #define MANIFEST_HPP_

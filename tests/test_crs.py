@@ -19,10 +19,9 @@ from heightmap_prep.crs import (
     check_known_points,
     configure_proj,
     crs_matches,
-    densified_boundary,
     epsg_code_of,
     select_vertical_operation,
-    wgs84_bounds_to_projected,
+    project_points,
 )
 from heightmap_prep.errors import CrsError, NonFiniteTransformError
 
@@ -180,43 +179,18 @@ def test_transformers_are_per_thread(proj_dir: Path) -> None:
 # --- horizontal helpers ---------------------------------------------------
 
 
-def test_densified_boundary_includes_the_corners() -> None:
-    xs, ys = densified_boundary(14.2, 49.95, 14.7, 50.25, samples_per_edge=8)
-    points = set(zip(xs.tolist(), ys.tolist()))
-    for corner in ((14.2, 49.95), (14.2, 50.25), (14.7, 50.25), (14.7, 49.95)):
-        assert corner in points
+def test_project_points_matches_a_plain_pyproj_transform() -> None:
+    lons, lats = [14.6327381, 14.4178914], [50.0905258, 50.0765653]
+    xs, ys = project_points(lons, lats)
+    reference = Transformer.from_crs("EPSG:4326", "EPSG:5514", always_xy=True)
+    for x, y, lon, lat in zip(xs, ys, lons, lats):
+        assert (x, y) == reference.transform(lon, lat)
+    assert all(-905_000 < x < -431_000 for x in xs)
 
 
-@pytest.mark.parametrize(
-    "box",
-    [
-        (12.0, 48.5, 18.9, 51.1),  # Czechia: corners already bound the area
-        (5.0, 45.0, 25.0, 55.0),
-        (14.0, 40.0, 15.0, 60.0),  # tall: Krovak curvature bites hard
-    ],
-)
-def test_densification_never_shrinks_the_projected_extent(box) -> None:
-    dense = wgs84_bounds_to_projected(*box, samples_per_edge=512)
-    sparse = wgs84_bounds_to_projected(*box, samples_per_edge=2)  # corners only
-    assert dense[0] <= sparse[0] and dense[1] <= sparse[1]
-    assert dense[2] >= sparse[2] and dense[3] >= sparse[3]
-
-
-def test_densification_recovers_area_that_corner_projection_would_clip() -> None:
-    # Krovak is an oblique conic: along a meridian the projected northing bulges
-    # past both corners, so corner-only projection would clip the region
-    # (specification section 7.2).
-    box = (14.0, 40.0, 15.0, 60.0)
-    dense = wgs84_bounds_to_projected(*box, samples_per_edge=512)
-    sparse = wgs84_bounds_to_projected(*box, samples_per_edge=2)
-    assert dense[3] - sparse[3] > 1000.0
-
-
-def test_projected_bounds_land_inside_czechia() -> None:
-    west, south, east, north = wgs84_bounds_to_projected(14.2, 49.95, 14.7, 50.25)
-    assert -905_000 < west < -431_000
-    assert -1_228_000 < south < -935_000
-    assert east > west and north > south
+def test_project_points_rejects_unprojectable_input() -> None:
+    with pytest.raises(CrsError, match="non-finite"):
+        project_points([float("nan")], [50.0])
 
 
 def test_configure_proj_rejects_a_missing_directory(tmp_path: Path) -> None:

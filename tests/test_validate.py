@@ -8,9 +8,11 @@ import numpy as np
 import pytest
 import yaml
 from affine import Affine
+from pyproj import Transformer
 
 from heightmap_prep.manifest import MANIFEST_FILENAME, Manifest
 from heightmap_prep.raster import write_raster
+from heightmap_prep.sampling import ReferencePoint, write_test_points
 from heightmap_prep.tiling import TileIndex
 from heightmap_prep.validate import (
     PLAUSIBLE_MAX_M,
@@ -19,6 +21,7 @@ from heightmap_prep.validate import (
     validate_dataset,
     validate_manifest,
     validate_spatial_consistency,
+    validate_test_points,
     validate_tile,
 )
 
@@ -223,7 +226,23 @@ def test_an_all_nodata_tile_warns(tmp_path: Path) -> None:
     report, facts = validate_tile(path, manifest, tile, plausibility=True)
     assert report.ok, report.errors
     assert facts is not None and facts.nodata_fraction == 1.0
-    assert any("NoData" in w for w in report.warnings)
+    assert any("no valid pixel" in w for w in report.warnings)
+
+
+def test_a_mostly_nodata_tile_does_not_warn(tmp_path: Path) -> None:
+    """Tiles only hold the pixels around safety areas, so this is normal."""
+    manifest = make_manifest()
+    tile = TileIndex(10, 10)
+    data = np.full((TILE_PX, TILE_PX), -9999.0, dtype=np.float32)
+    data[3:5, 3:5] = 300.0
+    path = manifest.tile_path(tmp_path, tile)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_raster(
+        path, data, transform=manifest.grid().tile_transform(tile), crs="EPSG:5514",
+        nodata=-9999.0, block_size_px=16,
+    )
+    report, _ = validate_tile(path, manifest, tile, plausibility=True)
+    assert report.ok and not report.warnings
 
 
 def test_plausibility_can_be_switched_off(tmp_path: Path) -> None:
@@ -356,3 +375,81 @@ def test_report_helpers() -> None:
     assert not report.ok
     with pytest.raises(Exception, match="broken"):
         report.raise_for_errors()
+
+
+# --- test points ----------------------------------------------------------
+
+
+def tile_centre_lonlat(manifest: Manifest, tile: TileIndex) -> tuple[float, float]:
+    bounds = manifest.grid().tile_bounds(tile)
+    to_wgs84 = Transformer.from_crs("EPSG:5514", "EPSG:4326", always_xy=True)
+    return to_wgs84.transform((bounds.west + bounds.east) / 2, (bounds.south + bounds.north) / 2)
+
+
+def with_test_points(root: Path, manifest: Manifest, heights: list[float]) -> None:
+    """Record one test point per height, all at the centre of tile (10, 10)."""
+    lon, lat = tile_centre_lonlat(manifest, TileIndex(10, 10))
+    write_test_points(
+        root / "test_points.csv", [ReferencePoint(lat, lon, h) for h in heights]
+    )
+    manifest.test_points_path = "test_points.csv"
+    manifest.test_points_count = len(heights)
+    manifest.write(root)
+
+
+def test_matching_test_points_pass(tmp_path: Path) -> None:
+    manifest = build_dataset(tmp_path)
+    with_test_points(tmp_path, manifest, [300.0, 300.0])
+    report = validate_dataset(tmp_path, require_complete=True)
+    assert report.ok, report.errors
+    assert not any("test points" in w for w in report.warnings)
+
+
+def test_a_wrong_test_point_height_is_an_error(tmp_path: Path) -> None:
+    manifest = build_dataset(tmp_path)
+    with_test_points(tmp_path, manifest, [300.001])
+    report = validate_test_points(tmp_path, manifest)
+    assert any("the tiles give 300.0" in e for e in report.errors)
+
+
+def test_a_test_point_off_the_tiles_is_an_error(tmp_path: Path) -> None:
+    manifest = build_dataset(tmp_path)
+    write_test_points(tmp_path / "test_points.csv", [ReferencePoint(50.0, 14.4, 300.0)])
+    manifest.test_points_path = "test_points.csv"
+    manifest.test_points_count = 1
+    report = validate_test_points(tmp_path, manifest)
+    assert any("the tiles give nan" in e for e in report.errors)
+
+
+def test_a_missing_test_points_file_is_an_error(tmp_path: Path) -> None:
+    manifest = build_dataset(tmp_path)
+    manifest.test_points_path = "test_points.csv"
+    assert any("is missing" in e for e in validate_test_points(tmp_path, manifest).errors)
+
+
+def test_a_test_point_count_mismatch_is_an_error(tmp_path: Path) -> None:
+    manifest = build_dataset(tmp_path)
+    with_test_points(tmp_path, manifest, [300.0])
+    manifest.test_points_count = 2
+    assert any("manifest declares 2" in e for e in validate_test_points(tmp_path, manifest).errors)
+
+
+def test_a_malformed_test_point_is_an_error(tmp_path: Path) -> None:
+    manifest = build_dataset(tmp_path)
+    (tmp_path / "test_points.csv").write_text("50.0,14.4\n", encoding="utf-8")
+    manifest.test_points_path = "test_points.csv"
+    manifest.test_points_count = 1
+    report = validate_test_points(tmp_path, manifest)
+    assert any("test_points.csv:1: malformed" in e for e in report.errors)
+
+
+def test_a_test_points_path_outside_the_dataset_is_an_error(tmp_path: Path) -> None:
+    manifest = build_dataset(tmp_path)
+    manifest.test_points_path = "../elsewhere.csv"
+    assert any("stays inside" in e for e in validate_test_points(tmp_path, manifest).errors)
+
+
+def test_a_dataset_without_test_points_warns(tmp_path: Path) -> None:
+    manifest = build_dataset(tmp_path)
+    report = validate_test_points(tmp_path, manifest)
+    assert report.ok and any("no test points" in w for w in report.warnings)

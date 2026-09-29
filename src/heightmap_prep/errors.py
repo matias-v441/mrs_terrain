@@ -18,10 +18,6 @@ class ConfigError(HeightmapPrepError):
     """A world configuration file is missing, malformed or self-inconsistent."""
 
 
-class InvalidBoundsError(ConfigError):
-    """World bounds are not a usable axis-aligned WGS84 box."""
-
-
 # --- coordinate reference systems / PROJ ---------------------------------
 
 

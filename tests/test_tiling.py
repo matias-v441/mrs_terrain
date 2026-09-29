@@ -8,11 +8,13 @@ import pytest
 
 from heightmap_prep.errors import ConfigError
 from heightmap_prep.tiling import (
+    PixelRange,
     ProjectedBounds,
     TileGrid,
     TileIndex,
     iter_blocks,
     parse_tile_filename,
+    polygon_intersects_bounds,
     tile_filename,
 )
 
@@ -83,58 +85,142 @@ def test_adjacent_tiles_abut_exactly() -> None:
     assert left.south == below.north
 
 
-def test_tiles_for_bounds_covers_the_area() -> None:
-    bounds = ProjectedBounds(-743_200.0, -1_044_000.0, -742_800.0, -1_043_600.0)
-    tiles = GRID.tiles_for_bounds(bounds)
-    assert tiles == [TileIndex(31, 29)]
+# --- pixels ---------------------------------------------------------------
+
+#: 10 px tiles at 2 m: tile (ix, iy) holds global columns 10*ix .. 10*ix + 9.
+SMALL = TileGrid.from_options(resolution_m=2.0, tile_size_px=10, origin_x=0.0, origin_y=0.0)
 
 
-def test_tiles_for_bounds_spans_several_tiles_in_reading_order() -> None:
-    origin = GRID.tile_bounds(TileIndex(4, 4))
-    bounds = ProjectedBounds(
-        origin.west + 1.0,
-        origin.south - GRID.tile_span_y + 1.0,
-        origin.east + 1.0,
-        origin.north - 1.0,
-    )
-    tiles = GRID.tiles_for_bounds(bounds)
-    assert tiles == [
-        TileIndex(4, 4),
-        TileIndex(5, 4),
-        TileIndex(4, 5),
-        TileIndex(5, 5),
+def neighbours(grid: TileGrid, x: float, y: float) -> set[tuple[int, int]]:
+    """The four global pixels a bilinear sampler reads for (x, y)."""
+    col0 = math.floor((x - grid.origin_x) / grid.resolution_x - 0.5)
+    row0 = math.floor((grid.origin_y - y) / grid.resolution_y - 0.5)
+    return {(col0 + dc, row0 + dr) for dc in (0, 1) for dr in (0, 1)}
+
+
+def tiles_of(grid: TileGrid, pixels: set[tuple[int, int]]) -> set[TileIndex]:
+    return {
+        TileIndex(col // grid.tile_width_px, row // grid.tile_height_px) for col, row in pixels
+    }
+
+
+def test_the_tile_pixels_follow_the_index_convention() -> None:
+    assert SMALL.tile_pixels(TileIndex(2, 3)) == PixelRange(20, 30, 29, 39)
+    assert SMALL.tile_pixels(TileIndex(-1, 0)) == PixelRange(-10, 0, -1, 9)
+
+
+def test_sampling_pixels_are_the_bilinear_neighbours_of_a_point() -> None:
+    x, y = 13.3, -27.7
+    pixels = SMALL.sampling_pixels([x], [y])
+    block = {
+        (c, r)
+        for c in range(pixels.col_min, pixels.col_max + 1)
+        for r in range(pixels.row_min, pixels.row_max + 1)
+    }
+    assert block == neighbours(SMALL, x, y)
+
+
+def test_sampling_pixels_cover_every_point_of_a_box() -> None:
+    xs, ys = [3.1, 41.7, 20.0], [-5.2, -33.9, -12.5]
+    pixels = SMALL.sampling_pixels(xs, ys)
+    for i in range(50):
+        for j in range(50):
+            x = 3.1 + (41.7 - 3.1) * i / 49
+            y = -33.9 + (-5.2 + 33.9) * j / 49
+            for col, row in neighbours(SMALL, x, y):
+                assert pixels.col_min <= col <= pixels.col_max
+                assert pixels.row_min <= row <= pixels.row_max
+
+
+def test_a_query_on_a_pixel_centre_line_keeps_both_neighbourhoods() -> None:
+    # x = 5.0 is the centre of column 2: a sampler may read columns 1-2 or 2-3.
+    pixels = SMALL.sampling_pixels([5.0], [-5.5])
+    assert (pixels.col_min, pixels.col_max) == (1, 3)
+
+
+@pytest.mark.parametrize("x", [19.1, 20.0, 20.9])
+def test_a_query_near_a_tile_edge_needs_both_tiles(x: float) -> None:
+    """Within half a pixel of the seam at x = 20, pixels on both sides are read."""
+    assert tiles_of(SMALL, neighbours(SMALL, x, -5.5)) == {TileIndex(0, 0), TileIndex(1, 0)}
+    for tile in (TileIndex(0, 0), TileIndex(1, 0)):
+        region = SMALL.sampling_region(tile)
+        assert region.west <= x <= region.east
+
+
+def test_sampling_regions_match_what_a_sampler_reads() -> None:
+    """A tile's sampling region holds exactly the queries that read one of its pixels."""
+    step = 0.37
+    for i in range(160):
+        for j in range(160):
+            x, y = -10.0 + i * step, 10.0 - j * step
+            read = tiles_of(SMALL, neighbours(SMALL, x, y))
+            for iy in range(-1, 4):
+                for ix in range(-1, 4):
+                    tile = TileIndex(ix, iy)
+                    region = SMALL.sampling_region(tile)
+                    inside = region.west <= x <= region.east and region.south <= y <= region.north
+                    if tile in read:
+                        assert inside, (x, y, tile)
+                    elif inside:
+                        # Only the slack band may include a tile nobody reads.
+                        assert (
+                            min(abs(x - region.west), abs(x - region.east),
+                                abs(y - region.south), abs(y - region.north))
+                            < 0.01
+                        ), (x, y, tile)
+
+
+def test_tiles_for_pixels_is_in_reading_order() -> None:
+    assert SMALL.tiles_for_pixels(PixelRange(8, 9, 12, 10)) == [
+        TileIndex(0, 0),
+        TileIndex(1, 0),
+        TileIndex(0, 1),
+        TileIndex(1, 1),
     ]
+    assert SMALL.tiles_for_pixels(PixelRange(-1, 0, 0, 0)) == [TileIndex(-1, 0), TileIndex(0, 0)]
 
 
-def test_bounds_ending_exactly_on_a_seam_do_not_pull_in_the_next_tile() -> None:
-    tile = GRID.tile_bounds(TileIndex(7, 7))
-    assert GRID.tiles_for_bounds(tile) == [TileIndex(7, 7)]
+def test_tile_window_and_pixel_bounds() -> None:
+    tile = TileIndex(1, 2)
+    pixels = PixelRange(12, 23, 15, 29)
+    assert SMALL.tile_window(tile, pixels) == (2, 3, 4, 7)
+    assert SMALL.pixels_bounds(pixels) == ProjectedBounds(24.0, -60.0, 32.0, -46.0)
+    with pytest.raises(ValueError, match="does not lie inside"):
+        SMALL.tile_window(tile, PixelRange(9, 23, 15, 29))
 
 
-def test_pixel_window_snaps_outward_and_clips_to_the_tile() -> None:
-    tile = TileIndex(31, 29)
-    bounds = GRID.tile_bounds(tile)
-    # A one-metre sliver inside the first pixel still selects that whole pixel.
-    window = GRID.pixel_window_for_bounds(
-        tile, ProjectedBounds(bounds.west + 0.5, bounds.north - 1.5, bounds.west + 1.5, bounds.north - 0.5)
-    )
-    assert window == (0, 0, 1, 1)
-
-    # An area larger than the tile is clipped to the tile.
-    window = GRID.pixel_window_for_bounds(tile, bounds.buffered(10_000.0))
-    assert window == (0, 0, GRID.tile_width_px, GRID.tile_height_px)
+def test_pixel_range_operations() -> None:
+    a = PixelRange(0, 0, 9, 9)
+    b = PixelRange(5, 5, 14, 14)
+    assert a.intersection(b) == PixelRange(5, 5, 9, 9)
+    assert a.union(b) == PixelRange(0, 0, 14, 14)
+    assert a.intersection(PixelRange(10, 0, 19, 9)) is None
+    # Ranges are inclusive, so sharing one column is an overlap.
+    assert a.intersection(PixelRange(9, 0, 19, 9)) == PixelRange(9, 0, 9, 9)
 
 
-def test_pixel_window_is_none_when_disjoint() -> None:
-    far = ProjectedBounds(0.0, 0.0, 100.0, 100.0)
-    assert GRID.pixel_window_for_bounds(TileIndex(31, 29), far) is None
+# --- polygons -------------------------------------------------------------
+
+BOX = ProjectedBounds(0.0, 0.0, 10.0, 10.0)
 
 
-def test_window_bounds_inverts_pixel_window() -> None:
-    tile = TileIndex(31, 29)
-    window = (100, 200, 300, 400)
-    bounds = GRID.window_bounds(tile, window)
-    assert GRID.pixel_window_for_bounds(tile, bounds) == window
+@pytest.mark.parametrize(
+    "polygon,expected",
+    [
+        ([(5, 5), (20, 5), (20, 20)], True),  # a vertex inside
+        ([(-10, -10), (30, -10), (30, 30), (-10, 30)], True),  # box inside polygon
+        ([(-5, 4), (15, 4), (15, 6), (-5, 6)], True),  # a strip through, no vertex inside
+        ([(10, 12), (20, 12), (20, 20)], False),  # disjoint
+        ([(12, -20), (30, 30), (12, 30)], False),  # disjoint, although the boxes overlap
+        ([(10, 10), (20, 10), (20, 20)], True),  # touches a corner
+        ([(-20, 30), (30, -20), (30, 30)], True),  # hypotenuse cuts the box
+        ([(-20, 15), (15, -20), (-30, -30)], False),  # hypotenuse passes it by
+    ],
+)
+def test_polygon_intersects_bounds(polygon, expected: bool) -> None:
+    xs = [float(x) for x, _ in polygon]
+    ys = [float(y) for _, y in polygon]
+    assert polygon_intersects_bounds(xs, ys, BOX) is expected
 
 
 def test_filenames_are_deterministic_and_parseable() -> None:
@@ -149,7 +235,8 @@ def test_projected_bounds_operations() -> None:
     a = ProjectedBounds(0.0, 0.0, 10.0, 10.0)
     b = ProjectedBounds(5.0, 5.0, 15.0, 15.0)
     assert a.intersection(b) == ProjectedBounds(5.0, 5.0, 10.0, 10.0)
-    assert a.union(b) == ProjectedBounds(0.0, 0.0, 15.0, 15.0)
+    assert a.contains(ProjectedBounds(1.0, 1.0, 10.0, 10.0))
+    assert not a.contains(b)
     assert a.intersection(ProjectedBounds(20.0, 20.0, 30.0, 30.0)) is None
     # Touching rectangles share no area.
     assert a.intersection(ProjectedBounds(10.0, 0.0, 20.0, 10.0)) is None

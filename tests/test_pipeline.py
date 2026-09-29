@@ -7,24 +7,73 @@ exercise the whole pipeline without touching the network.
 from __future__ import annotations
 
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 import rasterio
+import yaml
+from pyproj import Transformer
 
 from heightmap_prep import PrepareOptions, prepare_worlds
-from heightmap_prep.config import load_world
+from heightmap_prep.config import WorldConfig, load_world
 from heightmap_prep.crs import build_converter
-from heightmap_prep.errors import OutOfCoverageError, OutputConflictError
+from heightmap_prep.errors import (
+    ConfigError,
+    OutOfCoverageError,
+    OutputConflictError,
+    ValidationError,
+)
 from heightmap_prep.manifest import STATUS_COMPLETE, Manifest
 from heightmap_prep.pipeline import merge_tile_requirements, plan_world, validate_only
 from heightmap_prep.raster import TAG_SOURCE_ID, TAG_VERTICAL_DATUM, read_tags
-from heightmap_prep.tiling import TileGrid, TileIndex
+from heightmap_prep.sampling import DatasetSampler, read_test_points
+from heightmap_prep.tiling import ProjectedBounds, TileGrid, TileIndex
 
-from conftest import TEST_AREA, SyntheticSource
+from conftest import REPO_ROOT, SECOND_WORLD_POINTS, TEST_AREA, SyntheticSource, mrs_world
 
 TILE_PX = 128
+
+#: The grid prepare_worlds builds for these tests (phase-aligned, 256 m tiles).
+GRID = TileGrid.from_options(2.0, TILE_PX, -999_999.6, -800_000.12)
+
+_TO_WGS84 = Transformer.from_crs("EPSG:5514", "EPSG:4326", always_xy=True)
+
+
+def projected_world(name: str, vertices: list[tuple[float, float]]) -> WorldConfig:
+    """A world whose safety area has the given EPSG:5514 vertices."""
+    return WorldConfig(name=name, points=tuple(_TO_WGS84.transform(x, y) for x, y in vertices))
+
+
+def write_world(path: Path, world: WorldConfig) -> Path:
+    points = ", ".join(f"{lat!r}, {lon!r}" for lon, lat in world.points)
+    path.write_text(mrs_world(points), encoding="utf-8")
+    return path
+
+
+def reference_sampler(dataset: Path):
+    """examples/sampler.py, the sampler the dataset is meant for."""
+    sys.path.insert(0, str(REPO_ROOT / "examples"))
+    try:
+        from sampler import HeightSampler
+    finally:
+        sys.path.pop(0)
+    return HeightSampler(dataset)
+
+
+def polygon_samples(world: WorldConfig, per_edge: int = 25) -> list[tuple[float, float]]:
+    """Points along every edge of the safety area, plus its centroid."""
+    points = list(world.points)
+    samples = []
+    for (lon0, lat0), (lon1, lat1) in zip(points, points[1:] + points[:1]):
+        for k in range(per_edge):
+            t = k / per_edge
+            samples.append((lon0 + (lon1 - lon0) * t, lat0 + (lat1 - lat0) * t))
+    samples.append(
+        (sum(lon for lon, _ in points) / len(points), sum(lat for _, lat in points) / len(points))
+    )
+    return samples
 
 
 def options(proj_dir: Path, **overrides) -> PrepareOptions:
@@ -140,8 +189,8 @@ def test_the_dataset_answers_a_wgs84_query(
     manifest = result.manifest
     world = load_world(world_file)
 
-    lon = (world.bounds.west + world.bounds.east) / 2
-    lat = (world.bounds.south + world.bounds.north) / 2
+    lon = sum(lon for lon, _ in world.points) / len(world.points)
+    lat = sum(lat for _, lat in world.points) / len(world.points)
     x, y = Transformer.from_crs("EPSG:4326", manifest.horizontal_crs, always_xy=True).transform(
         lon, lat
     )
@@ -162,35 +211,88 @@ def test_the_dataset_answers_a_wgs84_query(
 
 
 def test_worlds_are_planned_onto_the_global_grid(world_file: Path) -> None:
-    grid = TileGrid.from_options(2.0, TILE_PX, -999_999.6, -800_000.12)
-    world = load_world(world_file)
-    plan = plan_world(world, grid, TEST_AREA)
+    plan = plan_world(load_world(world_file), GRID, TEST_AREA)
     assert plan.tiles
-    assert set(plan.tiles) == set(grid.tiles_for_bounds(plan.projected_bounds))
+    assert set(plan.tiles) <= set(GRID.tiles_for_pixels(plan.pixels))
 
 
-def test_a_world_outside_coverage_is_rejected(tmp_path: Path) -> None:
-    path = tmp_path / "atlantic.yaml"
-    path.write_text(
-        "name: atlantic\nbounds:\n  west: -30.0\n  south: 40.0\n  east: -29.0\n  north: 41.0\n",
-        encoding="utf-8",
+def test_a_world_outside_coverage_is_rejected() -> None:
+    atlantic = WorldConfig("atlantic", ((-30.0, 40.0), (-29.0, 40.0), (-29.0, 41.0)))
+    with pytest.raises(OutOfCoverageError, match="not inside the source coverage"):
+        plan_world(atlantic, GRID, TEST_AREA)
+
+
+def test_a_world_partly_outside_coverage_is_rejected() -> None:
+    """Every point of the safety area must be samplable, so no clipping."""
+    world = projected_world(
+        "straddling",
+        [(-743_600.0, -1_044_000.0), (-743_300.0, -1_044_000.0), (-743_300.0, -1_043_800.0)],
     )
-    grid = TileGrid.from_options(2.0, TILE_PX, -999_999.6, -800_000.12)
-    with pytest.raises(OutOfCoverageError, match="does not intersect"):
-        plan_world(load_world(path), grid, TEST_AREA)
+    with pytest.raises(OutOfCoverageError, match="not inside the source coverage"):
+        plan_world(world, GRID, TEST_AREA)
+
+
+# A tile corner inside TEST_AREA, where the seams x = SEAM_X and y = SEAM_Y meet.
+SEAM_X = GRID.tile_bounds(TileIndex(1003, 953)).east
+SEAM_Y = GRID.tile_bounds(TileIndex(1003, 953)).south
+NW, NE, SW, SE = (
+    TileIndex(1003, 953),
+    TileIndex(1004, 953),
+    TileIndex(1003, 954),
+    TileIndex(1004, 954),
+)
+
+
+def seam_triangle(name: str, west_x: float) -> WorldConfig:
+    """A triangle north of SEAM_Y whose westmost vertex is at ``west_x``."""
+    return projected_world(
+        name,
+        [(west_x, SEAM_Y + 50.0), (SEAM_X + 80.0, SEAM_Y + 20.0), (SEAM_X + 80.0, SEAM_Y + 90.0)],
+    )
+
+
+def test_the_seam_constants_are_a_tile_corner() -> None:
+    assert GRID.index_for_point(SEAM_X + 1, SEAM_Y + 1) == NE
+    assert GRID.index_for_point(SEAM_X - 1, SEAM_Y - 1) == SW
+
+
+def test_a_safety_area_touching_a_tile_edge_pulls_in_the_adjacent_tile() -> None:
+    """A vertex exactly on a seam is interpolated from pixels on both sides."""
+    assert set(plan_world(seam_triangle("on", SEAM_X), GRID, TEST_AREA).tiles) == {NW, NE}
+
+
+def test_a_safety_area_within_half_a_pixel_of_a_tile_edge_pulls_in_the_adjacent_tile() -> None:
+    plan = plan_world(seam_triangle("near", SEAM_X + 0.9), GRID, TEST_AREA)
+    assert set(plan.tiles) == {NW, NE}
+
+
+def test_a_safety_area_clear_of_a_tile_edge_stays_in_its_tile() -> None:
+    assert plan_world(seam_triangle("clear", SEAM_X + 1.2), GRID, TEST_AREA).tiles == [NE]
+
+
+def test_a_diagonal_safety_area_skips_tiles_only_its_bounding_box_touches() -> None:
+    # A triangle over the corner whose hypotenuse passes 14 m north-east of it,
+    # so it never comes near the south-west tile.
+    world = projected_world(
+        "diagonal",
+        [
+            (SEAM_X - 80.0, SEAM_Y + 100.0),
+            (SEAM_X + 120.0, SEAM_Y + 100.0),
+            (SEAM_X + 120.0, SEAM_Y - 100.0),
+        ],
+    )
+    plan = plan_world(world, GRID, TEST_AREA)
+    assert SW in GRID.tiles_for_pixels(plan.pixels)
+    assert set(plan.tiles) == {NW, NE, SE}
 
 
 def test_overlapping_worlds_share_one_fetch_per_tile(world_file: Path) -> None:
-    grid = TileGrid.from_options(2.0, TILE_PX, -999_999.6, -800_000.12)
-    world = load_world(world_file)
-    plan = plan_world(world, grid, TEST_AREA)
-    required = merge_tile_requirements([plan, plan], grid)
+    plan = plan_world(load_world(world_file), GRID, TEST_AREA)
+    required = merge_tile_requirements([plan, plan], GRID)
     assert set(required) == set(plan.tiles)
-    for tile, bounds in required.items():
+    for tile, pixels in required.items():
         # Merging the same world twice must not enlarge the area to fetch.
-        assert bounds.as_tuple() == grid.tile_bounds(tile).intersection(
-            plan.projected_bounds
-        ).as_tuple()
+        assert pixels == plan.pixels.intersection(GRID.tile_pixels(tile))
 
 
 def test_only_the_requested_part_of_a_tile_is_fetched(
@@ -217,13 +319,21 @@ def test_nodata_fills_the_part_of_a_tile_no_world_asked_for(
 def test_source_nodata_survives_into_the_output(
     world_file: Path, tmp_path: Path, proj_dir: Path
 ) -> None:
-    # Buffered so that snapping the fetch window outward to whole pixels cannot
-    # reach past the hole and pick up real values at the edges.
-    source = SyntheticSource(nodata_region=TEST_AREA.buffered(1_000.0))
+    # A hole in the middle of the safety area, away from its corners.
+    hole = ProjectedBounds(-743_050.0, -1_044_050.0, -742_950.0, -1_043_950.0)
+    source = SyntheticSource(nodata_region=hole)
     result = run(world_file, tmp_path / "out", proj_dir, source=source)
-    for tile in result.manifest.tiles:
-        with rasterio.open(result.manifest.tile_path(result.output_dir, tile)) as dataset:
-            assert np.all(dataset.read(1) == result.manifest.nodata)
+    with DatasetSampler(result.output_dir) as sampler:
+        lon, lat = _TO_WGS84.transform(-743_000.0, -1_044_000.0)
+        assert math.isnan(sampler.sample(lon, lat))
+
+
+def test_a_run_whose_only_world_has_no_corner_data_fails(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    source = SyntheticSource(nodata_region=TEST_AREA.buffered(1_000.0))
+    with pytest.raises(ValidationError, match="nothing to publish"):
+        run(world_file, tmp_path / "out", proj_dir, source=source)
 
 
 # --- resume and atomicity (section 18) -----------------------------------
@@ -355,12 +465,8 @@ def test_workers_produce_identical_output(
 
 
 def test_two_worlds_share_one_dataset(tmp_path: Path, world_file: Path, proj_dir: Path) -> None:
-    second = tmp_path / "second.yaml"
-    second.write_text(
-        "name: second\nbounds:\n"
-        "  west: 14.4240\n  south: 50.0800\n  east: 14.4300\n  north: 50.0845\n",
-        encoding="utf-8",
-    )
+    second = tmp_path / "world_second.yaml"
+    second.write_text(mrs_world(SECOND_WORLD_POINTS), encoding="utf-8")
     result = prepare_worlds(
         [world_file, second],
         tmp_path / "out",
@@ -369,8 +475,10 @@ def test_two_worlds_share_one_dataset(tmp_path: Path, world_file: Path, proj_dir
     )
     assert result.report.ok, result.report.errors
     assert result.manifest.worlds == ["testworld", "second"]
-    assert set(result.manifest.world_bounds_wgs84) == {"testworld", "second"}
     assert len(result.plans) == 2
+    assert len(result.test_points) == 8
+    # The dataset is exactly the union of what each world needs.
+    assert set(result.manifest.tiles) == {t for plan in result.plans for t in plan.tiles}
     # Tiles are shared, never duplicated.
     assert len(result.manifest.tiles) == len(set(result.manifest.tiles))
 
@@ -409,3 +517,187 @@ def test_a_source_on_the_wrong_vertical_datum_is_refused(
     source.vertical_crs = "EPSG:5705"  # Baltic 1977, not Bpv
     with pytest.raises(UnexpectedVerticalDatumError, match="EPSG:8357"):
         run(world_file, tmp_path / "out", proj_dir, source=source)
+
+
+# --- coverage of the safety areas ----------------------------------------
+
+
+def assert_samplable_everywhere(dataset: Path, world: WorldConfig) -> None:
+    sampler = reference_sampler(dataset)
+    try:
+        for lon, lat in polygon_samples(world):
+            assert math.isfinite(sampler.sample(lon, lat)), (lon, lat)
+    finally:
+        sampler.close()
+
+
+def test_every_point_of_the_safety_area_is_samplable(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    result = run(world_file, tmp_path / "out", proj_dir)
+    assert_samplable_everywhere(result.output_dir, load_world(world_file))
+
+
+def test_a_safety_area_on_a_tile_edge_is_samplable_along_it(
+    tmp_path: Path, proj_dir: Path
+) -> None:
+    path = write_world(tmp_path / "world_on_seam.yaml", seam_triangle("on_seam", SEAM_X))
+    result = run(path, tmp_path / "out", proj_dir)
+    assert set(result.manifest.tiles) == {NW, NE}
+    assert_samplable_everywhere(result.output_dir, load_world(path))
+
+
+def test_the_dataset_holds_only_the_needed_tiles(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    result = run(world_file, tmp_path / "out", proj_dir)
+    plan = plan_world(load_world(world_file), GRID, TEST_AREA)
+    assert result.manifest.tiles == sorted(plan.tiles)
+    assert sorted(p.name for p in (result.output_dir / "height").iterdir()) == sorted(
+        f"tile_{t.ix}_{t.iy}.tif" for t in plan.tiles
+    )
+
+
+def test_worlds_without_a_latlon_safety_area_are_skipped(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    metric = tmp_path / "world_metric.yaml"
+    metric.write_text(
+        mrs_world("10.0, 10.0, -10.0, 10.0, 0.0, -10.0", "world_origin"), encoding="utf-8"
+    )
+    result = prepare_worlds(
+        [world_file, metric], tmp_path / "out", options(proj_dir), source=SyntheticSource()
+    )
+    assert result.manifest.worlds == ["testworld"]
+
+    with pytest.raises(ConfigError, match="nothing to prepare"):
+        prepare_worlds([metric], tmp_path / "none", options(proj_dir), source=SyntheticSource())
+
+
+def test_the_manifest_carries_no_bounds(world_file: Path, tmp_path: Path, proj_dir: Path) -> None:
+    result = run(world_file, tmp_path / "out", proj_dir)
+    document = yaml.safe_load((result.output_dir / "dataset.yaml").read_text(encoding="utf-8"))
+    assert "world_bounds_wgs84" not in document
+    assert "dataset_bounds" not in document["grid"]
+
+
+# --- test points ----------------------------------------------------------
+
+
+def test_test_points_are_the_safety_area_corners(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    result = run(world_file, tmp_path / "out", proj_dir)
+    manifest = Manifest.read(result.output_dir)
+    assert manifest.test_points_path == "test_points.csv"
+    assert manifest.test_points_count == 4
+
+    lines = (result.output_dir / "test_points.csv").read_text(encoding="utf-8").splitlines()
+    assert lines[0].startswith("50.0800925,14.4166195,")
+    points = read_test_points(result.output_dir / "test_points.csv")
+    assert [(p.lon, p.lat) for p in points] == list(load_world(world_file).points)
+    assert all(250.0 < p.height < 350.0 for p in points)
+
+
+def test_test_points_match_the_reference_sampler_exactly(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    result = run(world_file, tmp_path / "out", proj_dir)
+    sampler = reference_sampler(result.output_dir)
+    try:
+        for point in read_test_points(result.output_dir / "test_points.csv"):
+            assert sampler.sample(point.lon, point.lat) == point.height
+    finally:
+        sampler.close()
+
+
+def test_shared_corners_are_listed_once(tmp_path: Path, world_file: Path, proj_dir: Path) -> None:
+    twin = tmp_path / "world_twin.yaml"
+    twin.write_text(world_file.read_text(encoding="utf-8"), encoding="utf-8")
+    result = prepare_worlds(
+        [world_file, twin], tmp_path / "out", options(proj_dir), source=SyntheticSource()
+    )
+    assert len(result.test_points) == 4
+
+
+def test_a_tampered_test_point_fails_validation(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    out = tmp_path / "out"
+    run(world_file, out, proj_dir)
+    path = out / "test_points.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    lat, lon, height = lines[0].split(",")
+    lines[0] = f"{lat},{lon},{float(height) + 0.01!r}"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    report = validate_only(out)
+    assert any("test point" in e for e in report.errors)
+
+
+# --- skipping world configs -----------------------------------------------
+
+#: A small triangle in the south-east of TEST_AREA, on a tile testworld does not use.
+LONELY = projected_world(
+    "lonely",
+    [(-742_650.0, -1_044_350.0), (-742_550.0, -1_044_450.0), (-742_650.0, -1_044_450.0)],
+)
+LONELY_TILE = TileIndex(1005, 954)
+
+
+def test_the_lonely_world_has_a_tile_of_its_own(world_file: Path) -> None:
+    assert plan_world(LONELY, GRID, TEST_AREA).tiles == [LONELY_TILE]
+    assert LONELY_TILE not in plan_world(load_world(world_file), GRID, TEST_AREA).tiles
+
+
+def test_a_world_outside_coverage_is_skipped(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    atlantic = tmp_path / "world_atlantic.yaml"
+    atlantic.write_text(mrs_world("40.0, -30.0, 40.0, -29.0, 41.0, -29.0"), encoding="utf-8")
+    result = prepare_worlds(
+        [world_file, atlantic], tmp_path / "out", options(proj_dir), source=SyntheticSource()
+    )
+    assert result.report.ok, result.report.errors
+    assert [w.name for w in result.worlds] == ["testworld"]
+    assert result.manifest.worlds == ["testworld"]
+    assert "not inside the source coverage" in result.skipped[atlantic]
+
+
+def test_a_world_without_corner_data_is_skipped_with_its_tiles(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    lonely = write_world(tmp_path / "world_lonely.yaml", LONELY)
+    hole = ProjectedBounds(-742_700.0, -1_044_480.0, -742_500.0, -1_044_320.0)
+    out = tmp_path / "out"
+    result = prepare_worlds(
+        [world_file, lonely], out, options(proj_dir), source=SyntheticSource(nodata_region=hole)
+    )
+    assert result.report.ok, result.report.errors
+    assert "no height around safety area corner" in result.skipped[lonely]
+    assert result.manifest.worlds == ["testworld"]
+    assert LONELY_TILE not in result.manifest.tiles
+    assert not result.manifest.tile_path(out, LONELY_TILE).exists()
+    assert all(o.tile != LONELY_TILE for o in result.outcomes)
+    assert len(result.test_points) == 4
+
+    manifest = Manifest.read(out)
+    assert manifest.worlds == ["testworld"] and manifest.test_points_count == 4
+    report = validate_only(out)
+    assert report.ok and not report.unexpected_files
+
+
+def test_a_bad_world_config_is_skipped(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    broken = tmp_path / "world_broken.yaml"
+    broken.write_text(mrs_world("50.08, 14.41, 50.07"), encoding="utf-8")
+    missing = tmp_path / "world_absent.yaml"
+    result = prepare_worlds(
+        [world_file, broken, missing],
+        tmp_path / "out",
+        options(proj_dir),
+        source=SyntheticSource(),
+    )
+    assert result.manifest.worlds == ["testworld"]
+    assert set(result.skipped) == {broken, missing}

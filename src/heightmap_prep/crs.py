@@ -410,43 +410,25 @@ def _transformer_4326_to(target_epsg: int) -> Transformer:
     return Transformer.from_crs(QUERY_CRS, f"EPSG:{target_epsg}", always_xy=True)
 
 
-def densified_boundary(
-    west: float, south: float, east: float, north: float, samples_per_edge: int
+def project_points(
+    lons: Sequence[float], lats: Sequence[float], *, target_epsg: int = 5514
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Points along the edges of a lon/lat box, including all four corners.
+    """Project WGS84 lon/lat points into ``target_epsg``.
 
-    Projection curvature means the projected bounding box of a large region is
-    not the projection of its corners, so the boundary is sampled before the
-    projected extent is derived (specification section 7.2).
+    Uses the same EPSG:4326 -> stored-CRS operation a runtime sampler applies to
+    its queries, so the pixels chosen here are the pixels a sampler will read.
     """
-    n = max(int(samples_per_edge), 2)
-    lon = np.linspace(west, east, n)
-    lat = np.linspace(south, north, n)
-    xs = np.concatenate([lon, lon, np.full(n, west), np.full(n, east)])
-    ys = np.concatenate([np.full(n, south), np.full(n, north), lat, lat])
-    return xs, ys
-
-
-def wgs84_bounds_to_projected(
-    west: float,
-    south: float,
-    east: float,
-    north: float,
-    *,
-    target_epsg: int = 5514,
-    samples_per_edge: int = 64,
-) -> tuple[float, float, float, float]:
-    """Project a WGS84 box into ``target_epsg`` without clipping its interior."""
-    lons, lats = densified_boundary(west, south, east, north, samples_per_edge)
-    xs, ys = _transformer_4326_to(target_epsg).transform(lons, lats, errcheck=True)
-    xs = np.asarray(xs, dtype=np.float64)
-    ys = np.asarray(ys, dtype=np.float64)
+    xs, ys = _transformer_4326_to(target_epsg).transform(
+        np.asarray(lons, dtype=np.float64), np.asarray(lats, dtype=np.float64), errcheck=True
+    )
+    xs = np.atleast_1d(np.asarray(xs, dtype=np.float64))
+    ys = np.atleast_1d(np.asarray(ys, dtype=np.float64))
     if not (np.all(np.isfinite(xs)) and np.all(np.isfinite(ys))):
         raise CrsError(
-            f"could not project bounds ({west}, {south}, {east}, {north}) "
-            f"into EPSG:{target_epsg}: transformation returned non-finite values"
+            f"could not project points into EPSG:{target_epsg}: "
+            "transformation returned non-finite values"
         )
-    return float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
+    return xs, ys
 
 
 # --- validation helpers --------------------------------------------------

@@ -1,7 +1,8 @@
-"""World configuration loading and option validation (specification sections 5, 6)."""
+"""World configs (MRS world files), input discovery and options."""
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -9,14 +10,15 @@ import pytest
 from heightmap_prep.config import (
     NOMINAL_GRID_ORIGIN,
     PrepareOptions,
-    Wgs84Bounds,
     align_origin,
     discover_world_paths,
     load_world,
     load_worlds,
-    resolve_dataset_settings,
+    world_name_from_path,
 )
-from heightmap_prep.errors import ConfigError, InvalidBoundsError
+from heightmap_prep.errors import ConfigError
+
+from conftest import TEST_WORLD_POINTS, mrs_world
 
 
 def write(path: Path, text: str) -> Path:
@@ -24,66 +26,83 @@ def write(path: Path, text: str) -> Path:
     return path
 
 
-MINIMAL = """\
-name: prague
-bounds:
-  type: wgs84
-  west: 14.20
-  south: 49.95
-  east: 14.70
-  north: 50.25
-heightmap:
-  source: cuzk-dmr5g
-  resolution_m: 2.0
-rgb:
-  enabled: false
-"""
+LATLON = mrs_world(TEST_WORLD_POINTS)
 
 
-def test_loads_the_specification_example(tmp_path: Path) -> None:
-    world = load_world(write(tmp_path / "prague.yaml", MINIMAL))
-    assert world.name == "prague"
-    assert world.source == "cuzk-dmr5g"
-    assert world.resolution_m == 2.0
-    assert world.rgb_enabled is False
-    assert world.bounds == Wgs84Bounds(14.20, 49.95, 14.70, 50.25)
+# --- parsing --------------------------------------------------------------
 
 
-def test_name_defaults_to_the_filename(tmp_path: Path) -> None:
-    text = MINIMAL.replace("name: prague\n", "")
-    assert load_world(write(tmp_path / "brno.yaml", text)).name == "brno"
+def test_latlon_points_are_read_as_lat_lon(tmp_path: Path) -> None:
+    world = load_world(write(tmp_path / "world_bechovice.yaml", LATLON))
+    assert world.name == "bechovice"
+    assert len(world.points) == 4
+    # Stored as (lon, lat); the file lists latitude first.
+    assert world.points[0] == (14.4166195, 50.0800925)
 
 
-def test_heightmap_section_is_optional(tmp_path: Path) -> None:
-    text = "bounds:\n  west: 14.2\n  south: 49.95\n  east: 14.7\n  north: 50.25\n"
-    world = load_world(write(tmp_path / "w.yaml", text))
-    assert world.resolution_m is None
-    assert world.source == "cuzk-dmr5g"
+def test_points_may_be_a_yaml_sequence(tmp_path: Path) -> None:
+    text = LATLON.replace(
+        f"points: [{TEST_WORLD_POINTS}]",
+        "points:\n" + "".join(f"          - {v.strip()}\n" for v in TEST_WORLD_POINTS.split(",")),
+    )
+    assert load_world(write(tmp_path / "w.yaml", text)).points == load_world(
+        write(tmp_path / "v.yaml", LATLON)
+    ).points
+
+
+def test_the_enabled_flag_is_irrelevant(tmp_path: Path) -> None:
+    text = LATLON.replace("enabled: true", "enabled: false")
+    assert len(load_world(write(tmp_path / "w.yaml", text)).points) == 4
+
+
+def test_world_names_come_from_the_filename() -> None:
+    assert world_name_from_path(Path("a/world_kn_yard.yaml")) == "kn_yard"
+    assert world_name_from_path(Path("ricany.yaml")) == "ricany"
+    assert world_name_from_path(Path("world_.yaml")) == "world_"
+
+
+@pytest.mark.parametrize("frame", ["world_origin", "local_origin", "fcu", ""])
+def test_a_safety_area_in_another_frame_is_rejected(tmp_path: Path, frame: str) -> None:
+    text = mrs_world("0.0, 0.0, 10.0, 0.0, 10.0, 10.0", frame=frame)
+    with pytest.raises(ConfigError, match="not 'latlon_origin'"):
+        load_world(write(tmp_path / "w.yaml", text))
 
 
 @pytest.mark.parametrize(
-    "bounds,message",
+    "text",
     [
-        ({"west": 14.7, "south": 49.9, "east": 14.2, "north": 50.2}, "east"),
-        ({"west": 14.2, "south": 50.3, "east": 14.7, "north": 50.2}, "north"),
-        ({"west": -200.0, "south": 49.9, "east": 14.7, "north": 50.2}, "longitudes"),
-        ({"west": 14.2, "south": -95.0, "east": 14.7, "north": 50.2}, "latitudes"),
+        "",
+        "just: a mapping\n",
+        "- a\n- list\n",
+        "mrs_uav_managers:\n  world_origin: {units: LATLON}\n",
+        "mrs_uav_managers:\n  safety_area_manager:\n    safety_area:\n      enabled: true\n",
     ],
 )
-def test_invalid_bounds_are_rejected(bounds: dict, message: str) -> None:
-    with pytest.raises(InvalidBoundsError, match=message):
-        Wgs84Bounds(**bounds)
+def test_a_file_without_a_safety_area_is_rejected(tmp_path: Path, text: str) -> None:
+    with pytest.raises(ConfigError, match="has no"):
+        load_world(write(tmp_path / "w.yaml", text))
 
 
-def test_missing_bounds_key_names_the_file(tmp_path: Path) -> None:
-    path = write(tmp_path / "w.yaml", "name: w\nbounds:\n  west: 14.2\n  south: 49.9\n")
-    with pytest.raises(ConfigError, match="east"):
-        load_world(path)
+@pytest.mark.parametrize(
+    "points,message",
+    [
+        ("50.08, 14.41, 50.07, 14.42, 50.07", "not a whole number"),
+        ("50.08, 14.41, 50.07, 14.42", "at least 3 vertices"),
+        ('"north", 14.41, 50.07, 14.42, 50.07, 14.43', "not a number"),
+        ("500.0, 14.41, 50.07, 14.42, 50.07, 14.43", "not a valid latitude/longitude"),
+        (".nan, 14.41, 50.07, 14.42, 50.07, 14.43", "not finite"),
+    ],
+)
+def test_a_malformed_latlon_safety_area_is_an_error(
+    tmp_path: Path, points: str, message: str
+) -> None:
+    with pytest.raises(ConfigError, match=message):
+        load_world(write(tmp_path / "w.yaml", mrs_world(points)))
 
 
-def test_unsupported_bounds_type(tmp_path: Path) -> None:
-    text = MINIMAL.replace("type: wgs84", "type: polygon")
-    with pytest.raises(ConfigError, match="unsupported bounds type"):
+def test_missing_points_are_an_error(tmp_path: Path) -> None:
+    text = LATLON.replace(f"        points: [{TEST_WORLD_POINTS}]\n", "")
+    with pytest.raises(ConfigError, match="no 'points'"):
         load_world(write(tmp_path / "w.yaml", text))
 
 
@@ -92,14 +111,47 @@ def test_missing_file(tmp_path: Path) -> None:
         load_world(tmp_path / "absent.yaml")
 
 
-def test_empty_file(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="empty"):
-        load_world(write(tmp_path / "w.yaml", ""))
-
-
 def test_malformed_yaml(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="invalid YAML"):
-        load_world(write(tmp_path / "w.yaml", "name: [unclosed\n"))
+        load_world(write(tmp_path / "w.yaml", "mrs_uav_managers: [unclosed\n"))
+
+
+# --- loading several worlds -----------------------------------------------
+
+
+def test_unusable_world_configs_are_skipped_with_a_warning(tmp_path: Path, caplog) -> None:
+    kept = write(tmp_path / "world_kept.yaml", LATLON)
+    metric = write(tmp_path / "world_metric.yaml", mrs_world("1, 2, 3, 4, 5, 6", "world_origin"))
+    unrelated = write(tmp_path / "unrelated.yaml", "some: other config\n")
+    malformed = write(tmp_path / "world_bad.yaml", mrs_world("50.08, 14.41, 50.07, 14.42"))
+    broken = write(tmp_path / "world_broken.yaml", "mrs_uav_managers: [unclosed\n")
+    missing = tmp_path / "world_absent.yaml"
+    with caplog.at_level(logging.WARNING):
+        worlds, skipped = load_worlds([kept, metric, unrelated, malformed, broken, missing])
+    assert [w.name for w in worlds] == ["kept"]
+    assert list(skipped) == [metric, unrelated, malformed, broken, missing]
+    assert "not 'latlon_origin'" in skipped[metric]
+    assert "at least 3 vertices" in skipped[malformed]
+    assert "invalid YAML" in skipped[broken]
+    assert "not found" in skipped[missing]
+    for path in skipped:
+        assert path.name in caplog.text
+
+
+def test_no_usable_world_leaves_nothing_but_reasons(tmp_path: Path) -> None:
+    metric = write(tmp_path / "world_metric.yaml", mrs_world("1, 2, 3, 4, 5, 6", "world_origin"))
+    worlds, skipped = load_worlds([metric])
+    assert worlds == [] and list(skipped) == [metric]
+
+
+def test_a_world_name_already_taken_is_skipped(tmp_path: Path) -> None:
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    a = write(tmp_path / "a" / "world_same.yaml", LATLON)
+    b = write(tmp_path / "b" / "world_same.yaml", LATLON)
+    worlds, skipped = load_worlds([a, b])
+    assert [w.path for w in worlds] == [a]
+    assert "already taken" in skipped[b]
 
 
 # --- input discovery (section 5) -----------------------------------------
@@ -108,23 +160,23 @@ def test_malformed_yaml(tmp_path: Path) -> None:
 def test_directory_input_is_expanded_and_sorted(tmp_path: Path) -> None:
     worlds = tmp_path / "worlds"
     worlds.mkdir()
-    write(worlds / "b.yaml", MINIMAL.replace("prague", "b"))
-    write(worlds / "a.yml", MINIMAL.replace("prague", "a"))
+    write(worlds / "b.yaml", LATLON)
+    write(worlds / "a.yml", LATLON)
     write(worlds / "notes.txt", "ignored")
     assert [p.name for p in discover_world_paths([worlds])] == ["a.yml", "b.yaml"]
 
 
 def test_file_inputs_keep_their_order(tmp_path: Path) -> None:
-    first = write(tmp_path / "one.yaml", MINIMAL.replace("prague", "one"))
-    second = write(tmp_path / "two.yaml", MINIMAL.replace("prague", "two"))
+    first = write(tmp_path / "one.yaml", LATLON)
+    second = write(tmp_path / "two.yaml", LATLON)
     assert discover_world_paths([second, first]) == [second, first]
 
 
 def test_mixing_a_directory_with_files_is_rejected(tmp_path: Path) -> None:
     worlds = tmp_path / "worlds"
     worlds.mkdir()
-    write(worlds / "a.yaml", MINIMAL)
-    extra = write(tmp_path / "extra.yaml", MINIMAL)
+    write(worlds / "a.yaml", LATLON)
+    extra = write(tmp_path / "extra.yaml", LATLON)
     with pytest.raises(ConfigError, match="either a single worlds directory"):
         discover_world_paths([worlds, extra])
 
@@ -136,47 +188,15 @@ def test_empty_directory_is_rejected(tmp_path: Path) -> None:
         discover_world_paths([worlds])
 
 
-def test_duplicate_world_names_are_rejected(tmp_path: Path) -> None:
-    a = write(tmp_path / "a.yaml", MINIMAL)
-    b = write(tmp_path / "b.yaml", MINIMAL)
-    with pytest.raises(ConfigError, match="duplicate world name"):
-        load_worlds([a, b])
-
-
-# --- dataset-wide settings ------------------------------------------------
-
-
-def test_resolution_is_inherited_from_options(tmp_path: Path) -> None:
-    text = "name: w\nbounds:\n  west: 14.2\n  south: 49.9\n  east: 14.7\n  north: 50.2\n"
-    world = load_world(write(tmp_path / "w.yaml", text))
-    assert resolve_dataset_settings([world], PrepareOptions(resolution_m=5.0)) == (
-        "cuzk-dmr5g",
-        5.0,
-    )
-
-
-def test_conflicting_resolutions_are_rejected(tmp_path: Path) -> None:
-    a = load_world(write(tmp_path / "a.yaml", MINIMAL.replace("prague", "a")))
-    b = load_world(
-        write(
-            tmp_path / "b.yaml",
-            MINIMAL.replace("prague", "b").replace("resolution_m: 2.0", "resolution_m: 5.0"),
-        )
-    )
-    with pytest.raises(ConfigError, match="same heightmap resolution"):
-        resolve_dataset_settings([a, b], PrepareOptions())
-
-
-def test_conflicting_sources_are_rejected(tmp_path: Path) -> None:
-    a = load_world(write(tmp_path / "a.yaml", MINIMAL.replace("prague", "a")))
-    b = load_world(
-        write(
-            tmp_path / "b.yaml",
-            MINIMAL.replace("prague", "b").replace("cuzk-dmr5g", "local-geotiff"),
-        )
-    )
-    with pytest.raises(ConfigError, match="same heightmap source"):
-        resolve_dataset_settings([a, b], PrepareOptions())
+@pytest.mark.skipif(
+    not (Path(__file__).resolve().parents[1] / "worlds").is_dir(), reason="no worlds/"
+)
+def test_the_repository_worlds_load() -> None:
+    """The shipped worlds with a latlon safety area load; the others are skipped."""
+    worlds, _ = load_worlds([Path(__file__).resolve().parents[1] / "worlds"])
+    names = {w.name for w in worlds}
+    assert {"bechovice", "kn_yard", "ricany"} <= names
+    assert "cisar" not in names and "local" not in names
 
 
 # --- options --------------------------------------------------------------

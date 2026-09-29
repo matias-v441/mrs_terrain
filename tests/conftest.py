@@ -131,23 +131,43 @@ def synthetic_source() -> SyntheticSource:
     return SyntheticSource()
 
 
+def mrs_world(points: str, frame: str = "latlon_origin") -> str:
+    """An MRS world file whose safety area has the given flat ``points`` list."""
+    return (
+        "mrs_uav_managers:\n"
+        "  world_origin:\n"
+        '    units: "LATLON"\n'
+        "    origin_x: 50.0785\n"
+        "    origin_y: 14.4205\n"
+        "  safety_area_manager:\n"
+        "    safety_area:\n"
+        "      enabled: true\n"
+        "      horizontal:\n"
+        f'        frame_name: "{frame}"\n'
+        f"        points: [{points}]\n"
+        "      vertical:\n"
+        '        frame_name: "world_origin"\n'
+        "        max_z: 30.0\n"
+        "        min_z: 1.0\n"
+    )
+
+
+#: A skewed quadrilateral, about 450 m across, inside ``TEST_AREA``.
+TEST_WORLD_POINTS = (
+    "50.0800925, 14.4166195, 50.0762346, 14.4181500, "
+    "50.0771058, 14.4238870, 50.0807978, 14.4225335"
+)
+
+#: A second, overlapping safety area east of the first.
+SECOND_WORLD_POINTS = (
+    "50.0812342, 14.4213118, 50.0790319, 14.4220648, "
+    "50.0795531, 14.4259025, 50.0817554, 14.4251496"
+)
+
+
 @pytest.fixture
 def world_file(tmp_path: Path) -> Path:
-    """A world covering a small patch of the synthetic source's coverage."""
-    path = tmp_path / "testworld.yaml"
-    path.write_text(
-        "name: testworld\n"
-        "bounds:\n"
-        "  type: wgs84\n"
-        "  west: 14.4180\n"
-        "  south: 50.0790\n"
-        "  east: 14.4260\n"
-        "  north: 50.0840\n"
-        "heightmap:\n"
-        "  source: cuzk-dmr5g\n"
-        "  resolution_m: 2.0\n"
-        "rgb:\n"
-        "  enabled: false\n",
-        encoding="utf-8",
-    )
+    """A world whose safety area lies inside the synthetic source's coverage."""
+    path = tmp_path / "world_testworld.yaml"
+    path.write_text(mrs_world(TEST_WORLD_POINTS), encoding="utf-8")
     return path
