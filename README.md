@@ -1,7 +1,57 @@
 # heightmap-prep
 
 Prepares terrain heightmap datasets for fast runtime sampling by geographic
-coordinates.
+coordinates, and samples them from ROS 2.
+
+## Quick start
+
+Clone this repository into a ROS 2 Jazzy workspace and build it. The dataset
+covering the worlds in [`worlds/`](worlds) is committed inside the
+`heightmap_sampler` package, so nothing needs to be configured or downloaded:
+
+```bash
+cd ~/ros2_ws/src
+git clone <this repository> heightmap-prep
+cd ~/ros2_ws
+rosdep install --from-paths src --ignore-src -y
+colcon build --packages-up-to heightmap_sampler
+source install/setup.bash
+
+ros2 run heightmap_sampler sample_height 14.6327381 50.0905258   # lon lat
+# 303.90541679951656
+```
+
+From C++, link `heightmap_sampler::heightmap_sampler` and:
+
+```cpp
+heightmap_sampler::HeightSampler sampler;                      // finds the bundled dataset
+std::optional<double> h = sampler.sample(50.0905258, 14.6327381);  // lat, lon
+```
+
+Heights are WGS84 ellipsoidal metres, the datum `regenerate.sh` prepares. A
+point outside the worlds' safety areas may have no height. There is also a ROS
+service node; see [the package README](src/heightmap_sampler/README.md).
+
+### Adding or changing a world
+
+1. Put the world's MRS world config in `worlds/`. Its safety area must be given
+   in `latlon_origin`.
+2. Run `./regenerate.sh`. The first run sets up `.venv` and downloads the PROJ
+   grids; elevation data comes from the ČÚZK service, so it needs the internet.
+3. Commit `src/heightmap_sampler/dataset` and rebuild the workspace.
+
+### Running the tests
+
+```bash
+./test_prep.sh      # heightmap-prep, the Python library (pytest)
+./test_sampler.sh   # heightmap_sampler, the C++ library (needs ROS 2 Jazzy)
+```
+
+`test_sampler.sh` builds the packages in a private workspace under `_colcon/`,
+runs their unit tests, the tests against the bundled dataset and the ROS
+linters, then checks the C++ sampler against the Python reference sampler.
+
+## How it works
 
 The library acquires [ČÚZK DMR 5G](https://ags.cuzk.gov.cz/dmr/) elevation data
 in S-JTSK / Krovak East North (EPSG:5514), converts the source Bpv heights onto a
@@ -312,6 +362,9 @@ its own, so it runs through EPSG:4979 and keeps only Z.
 
 ## Development
 
+`./test_prep.sh` runs the Python tests, creating `.venv` and fetching the PROJ
+grids first if needed; any arguments go to pytest. By hand:
+
 ```bash
 .venv/bin/pip install -e ".[dev]"
 .venv/bin/python -m pytest
@@ -325,6 +378,5 @@ skipped unless the PROJ grids are present in `./.proj` or at
 ## Not implemented in version 1
 
 RGB imagery (`--include-rgb` is accepted and warns), LAZ/PDAL input, local
-GeoTIFF input, EGM2008 and EVRF2007 outputs, Zarr storage, and polygonal world
-regions. The `HeightSource` adapter protocol in `sources.py` is the extension
+GeoTIFF input, EGM2008 and EVRF2007 outputs, and Zarr storage. The `HeightSource` adapter protocol in `sources.py` is the extension
 point for new inputs; the storage design does not need to change for any of them.

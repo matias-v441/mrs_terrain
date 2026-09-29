@@ -19,6 +19,8 @@ the prepared data; where there is none, both implementations must agree on that.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import math
 import random
 import subprocess
@@ -44,6 +46,12 @@ def cpp_sample(executable: list[str], dataset: Path, lon: float, lat: float) -> 
     if result.returncode != 0:
         raise RuntimeError(f"sample_height failed: {result.stderr.strip()}")
     return float(result.stdout.splitlines()[0])
+
+
+def reference_sample(reference: HeightSampler, lon: float, lat: float) -> float:
+    """One height from the Python reference, without whatever it prints."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        return reference.sample(lon, lat)
 
 
 def test_points(dataset: Path) -> list[tuple[float, float, float]]:
@@ -83,7 +91,7 @@ def main() -> int:
 
     mismatches = 0
     for lat, lon, height in points:
-        expected = reference.sample(lon, lat)
+        expected = reference_sample(reference, lon, lat)
         actual = cpp_sample(executable, dataset, lon, lat)
         if expected != height or not abs(actual - height) <= args.tolerance:
             print(
@@ -104,7 +112,7 @@ def main() -> int:
         lat = centre_lat + rng.uniform(-dlat, dlat)
         lon = centre_lon + rng.uniform(-dlon, dlon)
 
-        expected = reference.sample(lon, lat)
+        expected = reference_sample(reference, lon, lat)
         actual = cpp_sample(executable, dataset, lon, lat)
 
         if math.isnan(expected) and math.isnan(actual):

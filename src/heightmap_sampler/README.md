@@ -20,7 +20,7 @@ The dataset location is resolved by the library, not by the caller:
 heightmap_sampler::HeightSampler sampler;   // no path, no parameter, no config
 
 if (auto height = sampler.sample(49.3625695, 14.2619165)) {
-  use(*height);            // EGM96 orthometric metres
+  use(*height);            // metres, in the dataset's vertical datum
 } else {
   // No prepared height here: the tile is absent, the pixel is NoData, or the
   // point is outside the raster.
@@ -45,21 +45,24 @@ target_link_libraries(your_target heightmap_sampler::heightmap_sampler)
 
 The public header is a pimpl, so GDAL and yaml-cpp stay inside this package.
 
-## Choosing the dataset
+## The dataset
 
-The dataset ships **inside this package**, at
-`share/heightmap_sampler/dataset`, which is what a default-constructed
-`HeightSampler` reads. Which dataset that is, is a build-time decision:
+The dataset ships **inside this package**. It is committed in `dataset/`, is
+installed to `share/heightmap_sampler/dataset`, and is what a default-constructed
+`HeightSampler` reads. It covers the safety areas of the worlds in the
+repository's `worlds/`, with heights on the WGS84 ellipsoid. After changing
+those worlds, run `./regenerate.sh` from the repository root and commit the
+result.
+
+To bundle a different dataset instead, point the build at it:
 
 ```bash
 colcon build --packages-up-to heightmap_sampler --cmake-args \
   -DHEIGHTMAP_SAMPLER_DATASET_DIR=/path/to/prepared
 ```
 
-`HEIGHTMAP_SAMPLER_DATASET_DIR` defaults to `dataset/` inside this package, so
-dropping a prepared dataset there also works. If no `dataset.yaml` is found the
-package still builds, with a warning, and a default-constructed sampler fails
-at runtime.
+If no `dataset.yaml` is found there, the package still builds, with a warning,
+and a default-constructed sampler fails at runtime.
 
 To regenerate the dataset without rebuilding, write it straight into the
 install tree, or pass an explicit directory to the constructor.
@@ -96,23 +99,33 @@ The node is also registered as an `rclcpp_components` component,
 
 ## Tests
 
+From the repository root, `./test_sampler.sh` builds this package in a private
+workspace and runs everything below. Inside your own workspace:
+
 ```bash
 colcon test --packages-select heightmap_sampler
+colcon test-result --verbose
 ```
 
-The unit tests run against a committed synthetic fixture in `test/data`, whose
+`test_bundled_dataset` checks the bundled dataset: every reference height in
+its `test_points.csv`, which heightmap-prep computes at each safety area corner,
+must come out of this library, both from the dataset directory and from a
+default-constructed sampler reading the installed copy.
+
+The remaining unit tests run against a committed synthetic fixture in `test/data`, whose
 surface is a plane — bilinear interpolation of a plane is exact, so every
 expected value is closed form. `test/make_fixture.py` regenerates it, including
 the expected heights, which it derives with pyproj in the same direction the
 sampler transforms; a passing test therefore also confirms that GDAL's
 `EPSG:4326 -> EPSG:5514` transformation agrees with pyproj's.
 
-The check that matters most needs a real dataset and so lives outside the
-colcon test set:
+The parity check against the Python reference needs the project's Python
+environment, so it lives outside the colcon test set; `test_sampler.sh` runs it
+on the bundled dataset. By hand:
 
 ```bash
 source <workspace>/install/setup.bash
-.venv/bin/python src/heightmap_sampler/test/parity_check.py ./prepared
+.venv/bin/python src/heightmap_sampler/test/parity_check.py src/heightmap_sampler/dataset
 ```
 
 It first checks that both this library and the Python reference reproduce every

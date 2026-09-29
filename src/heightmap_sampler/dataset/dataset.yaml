@@ -1,0 +1,101 @@
+format_version: 1
+status: complete
+heightmap:
+  horizontal_crs: EPSG:5514
+  vertical_crs: EPSG:4979
+  vertical_datum: wgs84-ellipsoid
+  unit: m
+  dtype: float32
+  nodata: -9999.0
+grid:
+  resolution_x: 2.0
+  resolution_y: 2.0
+  tile_width_px: 4096
+  tile_height_px: 4096
+  origin_x: -999999.6
+  origin_y: -800000.12
+  axis_order: east_north
+  tile_span_x: 8192.0
+  tile_span_y: 8192.0
+  index_convention: origin is the west/north edge of tile (0, 0); ix increases eastward,
+    iy increases southward; ix = floor((x - origin_x) / tile_span_x), iy = floor((origin_y
+    - y) / tile_span_y)
+storage:
+  format: geotiff
+  compression: deflate
+  predictor: 3
+  block_width_px: 256
+  block_height_px: 256
+  tile_pattern: height/tile_{ix}_{iy}.tif
+source:
+  provider: CUZK
+  product: DMR5G
+  source_id: cuzk-dmr5g
+  source_horizontal_crs: EPSG:5514
+  source_vertical_crs: EPSG:8357
+  source_vertical_datum: bpv
+  source_resolution_m: 2.0
+  service_url: https://ags.cuzk.gov.cz/arcgis2/rest/services/dmr5g/ImageServer
+transform:
+  vertical:
+    method: proj
+    target: wgs84-ellipsoid
+    network_enabled: false
+    proj_operation: Inverse of Krovak East North (Greenwich) + S-JTSK to ETRS89 (1)
+      + Inverse of ETRS89 to Baltic 1957 height (2) + ETRS89 to WGS 84 (1) (with axis
+      order normalized for visualization)
+    proj_operation_accuracy_m: 2.03
+    proj_grids:
+    - cz_cuzk_CR-2005.tif
+    proj_grid_checksums:
+      cz_cuzk_CR-2005.tif: 7677bae1b69487a44e39421de30649f7
+sampling_contract:
+  query_crs: EPSG:4326
+  pixel_location: center
+  interpolation: bilinear
+worlds:
+- bechovice
+- brandysek
+- kn_yard
+- ricany
+- temesvar_field
+- temesvar_field_1
+- temesvar_field_12
+- temesvar_field_123
+- temesvar_field_2
+- temesvar_field_23
+- temesvar_field_3
+- temesvar_river
+tiles:
+  count: 5
+  index:
+  - - 28
+    - 39
+  - - 29
+    - 28
+  - - 31
+    - 29
+  - - 32
+    - 31
+  - - 33
+    - 29
+software:
+  package_version: 1.0.0
+  python_version: 3.12.3
+  rasterio_version: 1.5.1
+  gdal_version: 3.12.4
+  pyproj_version: 3.8.0
+  proj_version: 9.8.1
+processing:
+  created_utc: '2026-09-29T14:49:02Z'
+  updated_utc: '2026-09-29T14:49:11Z'
+  interpolation: nearest
+  vertical_conversion: proj
+  processing_version: '1'
+test_points:
+  path: test_points.csv
+  count: 42
+  columns:
+  - lat
+  - lon
+  - height

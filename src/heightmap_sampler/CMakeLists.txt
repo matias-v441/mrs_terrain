@@ -147,6 +147,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_height_sampler heightmap_sampler)
   target_compile_definitions(test_height_sampler
     PRIVATE HEIGHTMAP_SAMPLER_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/test/data")
+
+  # Reproduces the reference heights heightmap-prep shipped with the bundled
+  # dataset (its test_points.csv).
+  ament_add_gtest(test_bundled_dataset test/test_bundled_dataset.cpp)
+  target_link_libraries(test_bundled_dataset heightmap_sampler)
+  target_compile_definitions(test_bundled_dataset
+    PRIVATE HEIGHTMAP_SAMPLER_BUNDLED_DATASET="${HEIGHTMAP_SAMPLER_DATASET_DIR}")
 endif()
 
 ament_package()
