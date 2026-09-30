@@ -1,4 +1,4 @@
-# heightmap-prep
+# MRS Terrain
 
 Prepares terrain heightmap datasets for fast runtime sampling by geographic
 coordinates, and samples them from ROS 2.
@@ -11,10 +11,9 @@ covering the worlds in [`worlds/`](worlds) is committed inside the
 
 ```bash
 cd ~/ros2_ws/src
-git clone <this repository> heightmap-prep
+git clone <this repository> mrs_terrain
 cd ~/ros2_ws
-rosdep install --from-paths src --ignore-src -y
-colcon build --packages-up-to heightmap_sampler
+colcon build
 source install/setup.bash
 
 ros2 run heightmap_sampler sample_height 14.6327381 50.0905258   # lon lat
