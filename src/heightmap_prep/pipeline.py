@@ -3,6 +3,9 @@
 This is the orchestration layer that ties acquisition (:mod:`.cuzk`), vertical
 conversion (:mod:`.crs`, :mod:`.raster`), the global tile grid (:mod:`.tiling`),
 the manifest (:mod:`.manifest`) and validation (:mod:`.validate`) together.
+Optionally it adds an orthophoto tile in EPSG:4326 for every height tile
+(:mod:`.rgb`), and it always records the worlds in ``worlds.sqlite``
+(:mod:`.worlds_db`).
 
 The dataset holds exactly the tiles a bilinear sampler reads when queried
 anywhere inside the worlds' safety areas, borders included.  A world config that
@@ -22,6 +25,7 @@ from threading import Lock
 from typing import Sequence
 
 import numpy as np
+import rasterio
 
 from . import __version__
 from .config import (
@@ -41,7 +45,7 @@ from .crs import (
     build_converter,
     project_points,
 )
-from .cuzk import CuzkDmr5Source
+from .cuzk import CuzkDmr5Source, CuzkOrthophotoSource
 from .errors import (
     ConfigError,
     HeightmapPrepError,
@@ -54,24 +58,34 @@ from .errors import (
 from .manifest import (
     MANIFEST_FILENAME,
     Manifest,
+    RgbInfo,
     grid_file_checksums,
     software_versions,
 )
 from .raster import (
     ConversionStats,
     PROCESSING_VERSION,
+    RGB_BLOCK_PX,
+    RGB_PROCESSING_VERSION,
+    TAG_PACKAGE_VERSION,
     TAG_PROCESSING_VERSION,
     TAG_RESOLUTION,
+    TAG_RGB_FILLED,
+    TAG_RGB_JPEG_QUALITY,
+    TAG_RGB_RESOLUTION,
     TAG_SOURCE_ID,
     TAG_VERTICAL_CRS,
     TAG_VERTICAL_DATUM,
     convert_vertical,
     provenance_tags,
     read_tags,
+    rgb_storage_profile,
     write_raster_atomic,
+    write_rgb_window_atomic,
 )
+from .rgb import RgbGrid, RgbWindow
 from .sampling import TEST_POINTS_FILENAME, DatasetSampler, ReferencePoint, write_test_points
-from .sources import BaseHeightSource
+from .sources import BaseHeightSource, BaseRgbSource
 from .tiling import (
     PixelRange,
     ProjectedBounds,
@@ -79,7 +93,14 @@ from .tiling import (
     TileIndex,
     polygon_intersects_bounds,
 )
-from .validate import ValidationReport, validate_dataset, validate_tile, validate_vertical_transformation
+from .validate import (
+    ValidationReport,
+    validate_dataset,
+    validate_rgb_tile,
+    validate_tile,
+    validate_vertical_transformation,
+)
+from .worlds_db import write_worlds_db
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +136,8 @@ class PrepareResult:
     worlds: list[WorldConfig]
     plans: list[WorldPlan] = field(default_factory=list)
     outcomes: list[TileOutcome] = field(default_factory=list)
+    #: One per RGB tile; empty unless RGB imagery was requested.
+    rgb_outcomes: list[TileOutcome] = field(default_factory=list)
     report: ValidationReport = field(default_factory=ValidationReport)
     test_points: list[ReferencePoint] = field(default_factory=list)
     #: Each world config that was skipped, and why.
@@ -354,7 +377,151 @@ class _TileBuilder:
         report.raise_for_errors(f"tile {tile}")
 
 
+class _RgbTileBuilder:
+    """Builds the RGB tile of one height tile at a time; thread safe like :class:`_TileBuilder`.
+
+    The RGB tile spans its height tile's whole sampling region, but only the
+    imagery around the pixels the worlds need from that height tile is fetched.
+    """
+
+    def __init__(
+        self,
+        *,
+        grid: TileGrid,
+        manifest: Manifest,
+        output_dir: Path,
+        source: BaseRgbSource,
+        options: PrepareOptions,
+    ) -> None:
+        assert manifest.rgb is not None
+        self.grid = grid
+        self.rgb_grid = manifest.rgb.grid()
+        self.manifest = manifest
+        self.output_dir = Path(output_dir)
+        self.source = source
+        self.options = options
+        self.expected_tags = {
+            TAG_PACKAGE_VERSION: __version__,
+            TAG_PROCESSING_VERSION: RGB_PROCESSING_VERSION,
+            TAG_SOURCE_ID: source.source_id,
+            TAG_RGB_RESOLUTION: f"{options.rgb_resolution_m:.10g}",
+            TAG_RGB_JPEG_QUALITY: str(options.rgb_jpeg_quality),
+        }
+
+    def _is_reusable(
+        self, path: Path, tile: TileIndex, window: RgbWindow, fill: RgbWindow
+    ) -> tuple[bool, str]:
+        """Whether an existing RGB tile has this run's extent, provenance and imagery."""
+        tags = read_tags(path)
+        if not tags:
+            return False, "tile carries no provenance metadata"
+        for key in (TAG_SOURCE_ID, TAG_RGB_RESOLUTION, TAG_RGB_JPEG_QUALITY, TAG_PROCESSING_VERSION):
+            expected = self.expected_tags[key]
+            actual = tags.get(key)
+            if actual != expected:
+                return False, f"{key} is {actual!r}, this run produces {expected!r}"
+        filled = RgbWindow.from_tag(tags.get(TAG_RGB_FILLED))
+        if filled is None or not filled.contains(fill):
+            return False, "it holds imagery for less than the worlds now need"
+        try:
+            with rasterio.open(path) as dataset:
+                existing = self.rgb_grid.window_of_transform(
+                    dataset.transform, dataset.width, dataset.height
+                )
+        except Exception as exc:
+            return False, f"cannot open it: {exc}"
+        if existing != window:
+            return False, f"it spans {existing}, this run expects {window}"
+        report = validate_rgb_tile(path, self.manifest, tile, report=ValidationReport())
+        if report.errors:
+            return False, f"existing tile failed validation: {report.errors[0]}"
+        return True, ""
+
+    def build(self, tile: TileIndex, pixels: PixelRange) -> TileOutcome:
+        started = time.monotonic()
+        path = self.manifest.rgb_tile_path(self.output_dir, tile)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        window = self.rgb_grid.tile_window(self.grid, tile)
+        fill = self.rgb_grid.window_for_projected(self.grid.pixels_bounds(pixels))
+        fill = fill.intersection(window) or fill  # always inside; guards float noise
+
+        if path.exists():
+            reusable, reason = self._is_reusable(path, tile, window, fill)
+            if reusable and not self.options.overwrite:
+                log.debug("rgb tile %s: reusing %s", tile, path.name)
+                return TileOutcome(tile, "reused", path, duration_s=time.monotonic() - started)
+            if not self.options.overwrite:
+                raise OutputConflictError(
+                    f"rgb tile {tile}: {path} already exists but cannot be reused "
+                    f"({reason}); pass --overwrite to replace it"
+                )
+            log.debug("rgb tile %s: regenerating (%s)", tile, reason or "overwrite requested")
+
+        try:
+            rgba = self.source.read_rgba(self.rgb_grid, fill)
+        except SourceError as exc:
+            raise SourceError(
+                f"rgb tile {tile} (bounds {self.rgb_grid.window_bounds(fill)} in "
+                f"{self.source.crs}): {exc}"
+            ) from exc
+
+        col_off, row_off = fill.offset_in(window)
+        write_rgb_window_atomic(
+            path,
+            rgba,
+            profile=rgb_storage_profile(
+                width=window.width,
+                height=window.height,
+                transform=self.rgb_grid.window_transform(window),
+                crs=self.manifest.rgb.crs,
+                jpeg_quality=self.options.rgb_jpeg_quality,
+                block_size_px=self.manifest.rgb.block_width_px,
+            ),
+            col_off=col_off,
+            row_off=row_off,
+            overwrite=True,
+            validate=lambda tmp: self._validate_pending(tmp, tile),
+            tags={**self.expected_tags, TAG_RGB_FILLED: fill.to_tag()},
+        )
+        duration = time.monotonic() - started
+        log.debug(
+            "rgb tile %s: %s of a %s tile, %.2fs", tile, fill, f"{window.width}x{window.height}", duration
+        )
+        return TileOutcome(tile, "written", path, duration_s=duration)
+
+    def _validate_pending(self, tmp_path: Path, tile: TileIndex) -> None:
+        report = validate_rgb_tile(tmp_path, self.manifest, tile, report=ValidationReport())
+        for warning in report.warnings:
+            log.warning("%s", warning)
+        report.raise_for_errors(f"rgb tile {tile}")
+
+
 # --- entry points --------------------------------------------------------
+
+
+def _build_rgb_source(options: PrepareOptions) -> BaseRgbSource:
+    return CuzkOrthophotoSource(
+        timeout_s=options.request_timeout_s,
+        retries=options.request_retries,
+        cache_dir=options.cache_dir,
+    )
+
+
+def _rgb_info(source: BaseRgbSource, options: PrepareOptions) -> RgbInfo:
+    grid = RgbGrid.from_metres(options.rgb_resolution_m)
+    return RgbInfo(
+        resolution_m=options.rgb_resolution_m,
+        resolution_deg=grid.resolution_deg,
+        source_id=source.source_id,
+        source_service_url=getattr(source, "service_url", None),
+        source_provider=getattr(source, "provider", "CUZK"),
+        source_product=getattr(source, "product", "ORTOFOTO"),
+        jpeg_quality=options.rgb_jpeg_quality,
+        block_width_px=RGB_BLOCK_PX,
+        block_height_px=RGB_BLOCK_PX,
+        processing_version=RGB_PROCESSING_VERSION,
+    )
 
 
 def _build_source(options: PrepareOptions) -> BaseHeightSource:
@@ -478,13 +645,22 @@ def _restore_manifest(output_dir: Path, previous: bytes | None) -> None:
         log.warning("could not restore the previous manifest in %s: %s", output_dir, exc)
 
 
+def _tile_patterns(manifest: Manifest) -> list[str]:
+    """The tile pattern of every kind of tile the dataset holds."""
+    patterns = [manifest.tile_pattern]
+    if manifest.rgb is not None:
+        patterns.append(manifest.rgb.tile_pattern)
+    return patterns
+
+
 def _clean_stale_temporaries(output_dir: Path, manifest: Manifest) -> None:
-    height_dir = output_dir / Path(manifest.tile_relative_path(TileIndex(0, 0))).parent
-    if not height_dir.is_dir():
-        return
-    for leftover in height_dir.glob("*.tmp"):
-        log.debug("removing leftover temporary file %s", leftover)
-        leftover.unlink(missing_ok=True)
+    for pattern in _tile_patterns(manifest):
+        directory = output_dir / Path(pattern.format(ix=0, iy=0)).parent
+        if not directory.is_dir():
+            continue
+        for leftover in directory.glob("*.tmp"):
+            log.debug("removing leftover temporary file %s", leftover)
+            leftover.unlink(missing_ok=True)
 
 
 def _skip(skipped: dict[Path, str], world: WorldConfig, reason: str) -> None:
@@ -512,7 +688,8 @@ def _discard_unneeded_tiles(
     needed = {tile for plan in plans for tile in plan.tiles}
     for tile in manifest.tiles:
         if tile not in needed:
-            manifest.tile_path(output_dir, tile).unlink(missing_ok=True)
+            for pattern in _tile_patterns(manifest):
+                (output_dir / pattern.format(ix=tile.ix, iy=tile.iy)).unlink(missing_ok=True)
             log.info("removed tile %s, which only skipped worlds needed", tile)
     manifest.set_tiles(list(needed))
 
@@ -544,12 +721,14 @@ def prepare_worlds(
     options: PrepareOptions | None = None,
     *,
     source: BaseHeightSource | None = None,
+    rgb_source: BaseRgbSource | None = None,
 ) -> PrepareResult:
     """Prepare every world config in ``inputs`` into a dataset under ``output_dir``.
 
     ``source`` may be supplied to substitute the acquisition backend (used by
     the tests and by future adapters); by default the ČÚZK DMR 5G ImageServer is
-    used.
+    used.  ``rgb_source`` likewise substitutes the ČÚZK orthophoto service when
+    ``options.include_rgb`` is set.
     """
     options = options or PrepareOptions()
     output_dir = Path(output_dir)
@@ -585,6 +764,11 @@ def prepare_worlds(
 
     owned_source = source is None
     height_source = source or _build_source(options)
+    owned_rgb_source = rgb_source is None
+    if not options.include_rgb:
+        rgb_source = None
+    elif rgb_source is None:
+        rgb_source = _build_rgb_source(options)
 
     try:
         if height_source.vertical_crs != SOURCE_VERTICAL_CRS:
@@ -620,9 +804,18 @@ def prepare_worlds(
 
         coverage = height_source.coverage()
         plans: list[WorldPlan] = []
+        rgb_coverage = rgb_source.coverage() if rgb_source is not None else None
         for world in worlds:
             try:
-                plans.append(plan_world(world, grid, coverage))
+                plan = plan_world(world, grid, coverage)
+                needed = grid.pixels_bounds(plan.pixels)
+                if rgb_coverage is not None and not rgb_coverage.contains(needed):
+                    raise OutOfCoverageError(
+                        f"world {world.describe()}: the safety area needs EPSG:5514 extent "
+                        f"{tuple(round(v, 1) for v in needed.as_tuple())}, which is not "
+                        f"inside the {rgb_source.source_id} coverage {rgb_coverage.as_tuple()}"
+                    )
+                plans.append(plan)
             except HeightmapPrepError as exc:
                 _skip(skipped, world, str(exc))
         if not plans:
@@ -648,6 +841,8 @@ def prepare_worlds(
             operation=operation,
             options=options,
         )
+        if rgb_source is not None:
+            manifest.rgb = _rgb_info(rgb_source, options)
         manifest.set_tiles(list(required))
 
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -721,11 +916,39 @@ def prepare_worlds(
             remaining = set(manifest.tiles)
             outcomes = [o for o in outcomes if o.tile in remaining]
 
+        rgb_outcomes: list[TileOutcome] = []
+        rgb_bounds: dict[TileIndex, tuple[float, float, float, float]] = {}
+        if rgb_source is not None:
+            rgb_builder = _RgbTileBuilder(
+                grid=grid,
+                manifest=manifest,
+                output_dir=output_dir,
+                source=rgb_source,
+                options=options,
+            )
+            # Only the worlds still in the dataset decide what imagery to fetch.
+            rgb_outcomes = _run_builder(
+                rgb_builder, merge_tile_requirements(plans, grid), options.workers
+            )
+            written = sum(1 for o in rgb_outcomes if o.action == "written")
+            log.info("rgb tiles: %d written, %d reused", written, len(rgb_outcomes) - written)
+            for outcome in rgb_outcomes:
+                with rasterio.open(outcome.path) as dataset:
+                    rgb_bounds[outcome.tile] = tuple(dataset.bounds)
+
         test_points = _write_test_points(output_dir, manifest, worlds, heights)
-        manifest.write(output_dir)
         log.info(
             "wrote %d test point(s) to %s", len(test_points), output_dir / TEST_POINTS_FILENAME
         )
+        worlds_db = write_worlds_db(
+            output_dir,
+            manifest,
+            worlds,
+            {plan.world.name: plan.tiles for plan in plans},
+            rgb_bounds,
+        )
+        manifest.write(output_dir)
+        log.info("recorded %d world(s) in %s", len(worlds), worlds_db)
 
         if options.validate_tiles:
             report = validate_dataset(output_dir, plausibility=options.plausibility_checks)
@@ -745,23 +968,27 @@ def prepare_worlds(
             worlds=worlds,
             plans=plans,
             outcomes=outcomes,
+            rgb_outcomes=rgb_outcomes,
             report=report,
             test_points=test_points,
             skipped=skipped,
         )
     finally:
-        if owned_source:
-            close = getattr(height_source, "close", None)
-            if callable(close):
+        for owned, opened in ((owned_source, height_source), (owned_rgb_source, rgb_source)):
+            close = getattr(opened, "close", None)
+            if owned and callable(close):
                 close()
 
 
 def _run_builder(
-    builder: _TileBuilder,
+    builder: _TileBuilder | _RgbTileBuilder,
     required: dict[TileIndex, PixelRange],
     workers: int,
 ) -> list[TileOutcome]:
-    """Build every required tile, optionally across a bounded thread pool."""
+    """Build every required tile, optionally across a bounded thread pool.
+
+    ``builder`` is a height or an RGB tile builder; both build one tile per call.
+    """
     items = list(required.items())
     if workers <= 1 or len(items) <= 1:
         return [builder.build(tile, pixels) for tile, pixels in items]

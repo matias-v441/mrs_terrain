@@ -18,6 +18,7 @@ from typing import Any, Iterable, Sequence
 import yaml
 
 from .errors import ValidationError
+from .rgb import LATTICE_ORIGIN_LAT, LATTICE_ORIGIN_LON, RGB_CRS, RGB_TILE_PATTERN, RgbGrid
 from .tiling import TileGrid, TileIndex
 
 #: Only this manifest layout is understood.
@@ -66,6 +67,96 @@ def grid_file_checksums(paths: Iterable[Path]) -> dict[str, str]:
                 digest.update(chunk)
         checksums[path.name] = digest.hexdigest()
     return checksums
+
+
+#: How RGB tile ``(ix, iy)`` relates to height tile ``(ix, iy)``.
+RGB_TILE_EXTENT = (
+    "rgb tile (ix, iy) covers the EPSG:4326 bounding box of height tile (ix, iy) "
+    "grown by half a height pixel, snapped outward to the lattice; find it as for "
+    "the height tile, then locate pixels with its own geotransform. Only pixels "
+    "around the safety areas hold imagery; the internal mask marks them."
+)
+
+
+@dataclass
+class RgbInfo:
+    """The ``rgb`` section: orthophoto tiles in the query CRS."""
+
+    resolution_m: float
+    resolution_deg: float
+    source_id: str
+    source_service_url: str | None = None
+    source_provider: str = "CUZK"
+    source_product: str = "ORTOFOTO"
+    jpeg_quality: int = 90
+    block_width_px: int = 512
+    block_height_px: int = 512
+    crs: str = RGB_CRS
+    tile_pattern: str = RGB_TILE_PATTERN
+    origin_lon: float = LATTICE_ORIGIN_LON
+    origin_lat: float = LATTICE_ORIGIN_LAT
+    processing_version: str = "1"
+
+    def grid(self) -> RgbGrid:
+        return RgbGrid(self.resolution_deg, self.origin_lon, self.origin_lat)
+
+    def to_dict(self) -> dict[str, Any]:
+        source: dict[str, Any] = {
+            "provider": self.source_provider,
+            "product": self.source_product,
+            "source_id": self.source_id,
+            "reprojection": "server",
+        }
+        if self.source_service_url:
+            source["service_url"] = self.source_service_url
+        return {
+            "crs": self.crs,
+            "bands": ["red", "green", "blue"],
+            "dtype": "uint8",
+            "mask": "internal",
+            "resolution_m": float(self.resolution_m),
+            "resolution_deg": float(self.resolution_deg),
+            "lattice_origin_lon": float(self.origin_lon),
+            "lattice_origin_lat": float(self.origin_lat),
+            "tile_pattern": self.tile_pattern,
+            "tile_extent": RGB_TILE_EXTENT,
+            "storage": {
+                "format": "geotiff",
+                "compression": "jpeg",
+                "photometric": "ycbcr",
+                "jpeg_quality": int(self.jpeg_quality),
+                "block_width_px": int(self.block_width_px),
+                "block_height_px": int(self.block_height_px),
+            },
+            "source": source,
+            "processing_version": self.processing_version,
+        }
+
+    @classmethod
+    def from_dict(cls, section: Any, *, origin: str) -> "RgbInfo":
+        if not isinstance(section, dict):
+            raise ValidationError(f"{origin}: section 'rgb' must be a mapping")
+        storage = section.get("storage") or {}
+        source = section.get("source") or {}
+        for key in ("resolution_m", "resolution_deg", "tile_pattern"):
+            if section.get(key) is None:
+                raise ValidationError(f"{origin}: missing required key rgb.{key}")
+        return cls(
+            resolution_m=float(section["resolution_m"]),
+            resolution_deg=float(section["resolution_deg"]),
+            source_id=str(source.get("source_id", "")),
+            source_service_url=source.get("service_url"),
+            source_provider=str(source.get("provider", "")),
+            source_product=str(source.get("product", "")),
+            jpeg_quality=int(storage.get("jpeg_quality", 90)),
+            block_width_px=int(storage.get("block_width_px", 512)),
+            block_height_px=int(storage.get("block_height_px", 512)),
+            crs=str(section.get("crs", RGB_CRS)),
+            tile_pattern=str(section["tile_pattern"]),
+            origin_lon=float(section.get("lattice_origin_lon", LATTICE_ORIGIN_LON)),
+            origin_lat=float(section.get("lattice_origin_lat", LATTICE_ORIGIN_LAT)),
+            processing_version=str(section.get("processing_version", "1")),
+        )
 
 
 @dataclass
@@ -124,6 +215,11 @@ class Manifest:
     #: relative to the dataset directory.
     test_points_path: str | None = None
     test_points_count: int = 0
+    #: Orthophoto tiles, one per height tile; ``None`` when not prepared.
+    rgb: RgbInfo | None = None
+    #: SQLite database of the worlds, relative to the dataset directory.
+    worlds_db_path: str | None = None
+    worlds_db_schema_version: int = 0
 
     # reproducibility
     software: dict[str, str] = field(default_factory=dict)
@@ -159,6 +255,11 @@ class Manifest:
 
     def tile_path(self, root: Path, tile: TileIndex) -> Path:
         return Path(root) / self.tile_relative_path(tile)
+
+    def rgb_tile_path(self, root: Path, tile: TileIndex) -> Path:
+        if self.rgb is None:
+            raise ValidationError("the dataset has no RGB tiles")
+        return Path(root) / self.rgb.tile_pattern.format(ix=tile.ix, iy=tile.iy)
 
     # --- serialisation ---------------------------------------------------
 
@@ -247,6 +348,13 @@ class Manifest:
                 "count": int(self.test_points_count),
                 "columns": list(TEST_POINT_COLUMNS),
             }
+        if self.rgb is not None:
+            document["rgb"] = self.rgb.to_dict()
+        if self.worlds_db_path is not None:
+            document["worlds_db"] = {
+                "path": self.worlds_db_path,
+                "schema_version": int(self.worlds_db_schema_version),
+            }
         return document
 
     @classmethod
@@ -273,6 +381,14 @@ class Manifest:
         test_points = document.get("test_points") or {}
         if not isinstance(test_points, dict):
             raise ValidationError(f"{origin}: section 'test_points' must be a mapping")
+        worlds_db = document.get("worlds_db") or {}
+        if not isinstance(worlds_db, dict):
+            raise ValidationError(f"{origin}: section 'worlds_db' must be a mapping")
+        rgb = (
+            RgbInfo.from_dict(document["rgb"], origin=origin)
+            if document.get("rgb") is not None
+            else None
+        )
 
         def need(mapping: dict[str, Any], key: str, where: str) -> Any:
             if key not in mapping or mapping[key] is None:
@@ -331,6 +447,11 @@ class Manifest:
                 str(test_points["path"]) if test_points.get("path") is not None else None
             ),
             test_points_count=int(test_points.get("count", 0) or 0),
+            rgb=rgb,
+            worlds_db_path=(
+                str(worlds_db["path"]) if worlds_db.get("path") is not None else None
+            ),
+            worlds_db_schema_version=int(worlds_db.get("schema_version", 0) or 0),
             software=dict(document.get("software") or {}),
             created_utc=str(processing.get("created_utc", _utc_now())),
             updated_utc=str(processing.get("updated_utc", _utc_now())),

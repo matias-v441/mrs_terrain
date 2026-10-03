@@ -44,7 +44,9 @@ The prepared tiles cover every point of each world's safety area, which must be
 given in latlon_origin.  A world config that cannot be prepared -- unreadable,
 no latlon_origin safety area, outside the source coverage, no source data at a
 safety area corner -- is skipped with a warning.  test_points.csv in the output holds the height at every safety area
-corner, as lat,lon,height rows, for checking samplers against.
+corner, as lat,lon,height rows, for checking samplers against.  worlds.sqlite
+records each world's safety area, origin and tiles.  With --include-rgb, rgb/
+holds an orthophoto tile in EPSG:4326 for every height tile.
 
 exit codes:
   0  success
@@ -82,7 +84,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--include-rgb",
         action="store_true",
-        help="include RGB imagery (not implemented in version 1)",
+        help="also prepare ČÚZK orthophoto tiles in EPSG:4326, one per height tile",
+    )
+    parser.add_argument(
+        "--rgb-resolution",
+        type=float,
+        default=0.25,
+        metavar="FLOAT",
+        help="north-south ground size of an RGB pixel in metres (default: 0.25)",
+    )
+    parser.add_argument(
+        "--rgb-jpeg-quality",
+        type=int,
+        default=90,
+        metavar="INTEGER",
+        help="JPEG quality of the RGB tiles, 1-100 (default: 90)",
     )
     parser.add_argument(
         "--resolution",
@@ -214,6 +230,8 @@ def options_from_args(args: argparse.Namespace) -> PrepareOptions:
     return PrepareOptions(
         vertical_datum=args.vertical_datum,
         include_rgb=args.include_rgb,
+        rgb_resolution_m=args.rgb_resolution,
+        rgb_jpeg_quality=args.rgb_jpeg_quality,
         resolution_m=args.resolution,
         tile_size_px=args.tile_size,
         proj_data_dir=args.proj_data_dir,
@@ -259,12 +277,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(
             "expected at least one world input before OUTPUT_DIR; "
             f"got only {output_dir}"
-        )
-
-    if args.include_rgb:
-        log.warning(
-            "--include-rgb was requested but RGB acquisition is not implemented "
-            "in version 1; only heightmaps will be prepared"
         )
 
     try:

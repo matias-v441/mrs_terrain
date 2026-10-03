@@ -10,7 +10,7 @@ from heightmap_prep import cli
 from heightmap_prep.config import PrepareOptions
 from heightmap_prep.manifest import MANIFEST_FILENAME
 
-from conftest import SyntheticSource
+from conftest import SyntheticRgbSource, SyntheticSource
 
 
 def args(*argv: str):
@@ -35,6 +35,8 @@ def test_defaults_match_the_specification() -> None:
     parsed = args("w.yaml", "out")
     assert parsed.vertical_datum == "egm96"
     assert parsed.include_rgb is False
+    assert parsed.rgb_resolution == 0.25
+    assert parsed.rgb_jpeg_quality == 90
     assert parsed.resolution == 2.0
     assert parsed.tile_size == 4096
     assert parsed.workers == 1
@@ -153,18 +155,26 @@ def test_library_errors_become_exit_code_two(tmp_path: Path) -> None:
     assert code == 2
 
 
-def test_include_rgb_warns_that_it_is_not_implemented(
-    world_file: Path, tmp_path: Path, proj_dir: Path, monkeypatch, caplog
+def test_include_rgb_prepares_rgb_tiles(
+    world_file: Path, tmp_path: Path, proj_dir: Path, monkeypatch
 ) -> None:
     real = cli.prepare_worlds
-    monkeypatch.setattr(
-        cli,
-        "prepare_worlds",
-        lambda inputs, out, options: real(inputs, out, options, source=SyntheticSource()),
-    )
-    with caplog.at_level("WARNING"):
-        cli.main(
-            [str(world_file), str(tmp_path / "out"), "--proj-data-dir", str(proj_dir),
-             "--tile-size", "128", "--block-size", "16", "--include-rgb"]
+    seen = {}
+
+    def fake(inputs, out, options):
+        seen["options"] = options
+        return real(
+            inputs, out, options, source=SyntheticSource(), rgb_source=SyntheticRgbSource()
         )
-    assert any("RGB acquisition is not implemented" in r.message for r in caplog.records)
+
+    monkeypatch.setattr(cli, "prepare_worlds", fake)
+    out = tmp_path / "out"
+    code = cli.main(
+        [str(world_file), str(out), "--proj-data-dir", str(proj_dir), "--tile-size", "128",
+         "--block-size", "16", "--include-rgb", "--rgb-resolution", "1.0",
+         "--rgb-jpeg-quality", "80"]
+    )
+    assert code == 0
+    assert seen["options"].include_rgb and seen["options"].rgb_jpeg_quality == 80
+    assert list((out / "rgb").glob("tile_*.tif"))
+    assert (out / "worlds.sqlite").is_file()

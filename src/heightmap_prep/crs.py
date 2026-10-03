@@ -431,6 +431,24 @@ def project_points(
     return xs, ys
 
 
+def project_from(
+    xs: Sequence[float], ys: Sequence[float], *, source: str, target: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Transform points between two horizontal CRSs, x/y in east/north order."""
+    transformer = Transformer.from_crs(source, target, always_xy=True)
+    out_x, out_y = transformer.transform(
+        np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64), errcheck=True
+    )
+    out_x = np.atleast_1d(np.asarray(out_x, dtype=np.float64))
+    out_y = np.atleast_1d(np.asarray(out_y, dtype=np.float64))
+    if not (np.all(np.isfinite(out_x)) and np.all(np.isfinite(out_y))):
+        raise CrsError(
+            f"could not transform points from {source} into {target}: "
+            "transformation returned non-finite values"
+        )
+    return out_x, out_y
+
+
 # --- validation helpers --------------------------------------------------
 
 #: A handful of well-spread Czech locations used as a transformer smoke test.

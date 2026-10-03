@@ -2,7 +2,9 @@
 
 Acquisition is isolated behind a small protocol so that new inputs (local
 GeoTIFFs, LAZ via PDAL, …) can be added without touching the storage design
-(specification section 16).
+(specification section 16).  RGB imagery has an adapter of its own,
+:class:`BaseRgbSource`, since it is fetched in the query CRS rather than in the
+stored horizontal CRS.
 """
 
 from __future__ import annotations
@@ -11,12 +13,15 @@ import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Iterator, Protocol, runtime_checkable
 
 import numpy as np
 
 from .errors import OutOfCoverageError, ResolutionMismatchError
 from .tiling import ProjectedBounds
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .rgb import RgbGrid, RgbWindow
 
 log = logging.getLogger(__name__)
 
@@ -109,21 +114,18 @@ class BaseHeightSource:
         """
         res_x = bounds.width / width
         res_y = bounds.height / height
-        max_w = max(1, int(self.max_request_width_px))
-        max_h = max(1, int(self.max_request_height_px))
-        for row_off in range(0, height, max_h):
-            rows = min(max_h, height - row_off)
-            for col_off in range(0, width, max_w):
-                cols = min(max_w, width - col_off)
-                west = bounds.west + col_off * res_x
-                north = bounds.north - row_off * res_y
-                sub = ProjectedBounds(
-                    west=west,
-                    south=north - rows * res_y,
-                    east=west + cols * res_x,
-                    north=north,
-                )
-                yield sub, col_off, row_off, cols, rows
+        for col_off, row_off, cols, rows in split_pixels(
+            width, height, self.max_request_width_px, self.max_request_height_px
+        ):
+            west = bounds.west + col_off * res_x
+            north = bounds.north - row_off * res_y
+            sub = ProjectedBounds(
+                west=west,
+                south=north - rows * res_y,
+                east=west + cols * res_x,
+                north=north,
+            )
+            yield sub, col_off, row_off, cols, rows
 
     def read_block(self, bounds: ProjectedBounds, width: int, height: int) -> np.ndarray:
         """Return ``height`` x ``width`` source samples covering ``bounds``.
@@ -189,6 +191,89 @@ class BaseHeightSource:
             nodata=self.nodata,
         )
         return output_path
+
+
+def split_pixels(
+    width: int, height: int, max_width: int, max_height: int
+) -> Iterator[tuple[int, int, int, int]]:
+    """Split a ``width`` x ``height`` pixel window into server-sized pieces.
+
+    Yields ``(col_off, row_off, cols, rows)`` in reading order; the pieces tile
+    the window exactly, without gaps or overlap.
+    """
+    max_w = max(1, int(max_width))
+    max_h = max(1, int(max_height))
+    for row_off in range(0, height, max_h):
+        rows = min(max_h, height - row_off)
+        for col_off in range(0, width, max_w):
+            yield col_off, row_off, min(max_w, width - col_off), rows
+
+
+class BaseRgbSource:
+    """Shared behaviour for imagery sources serving arbitrary EPSG:4326 windows.
+
+    Imagery is requested on the dataset's RGB pixel lattice (:class:`.rgb.RgbGrid`)
+    directly in the query CRS.  Subclasses implement :meth:`_request_rgba` for a
+    single, already size-limited request; this base class splits a large window
+    into several requests and stitches the results.
+    """
+
+    crs: str = "EPSG:4326"
+    #: Largest request the backend accepts, in pixels.
+    max_request_width_px: int = 4096
+    max_request_height_px: int = 4096
+
+    # --- to implement ----------------------------------------------------
+
+    @property
+    def source_id(self) -> str:
+        """Stable identifier recorded on generated tiles for resume checks."""
+        raise NotImplementedError
+
+    def coverage(self) -> ProjectedBounds | None:
+        """Known extent of the imagery in EPSG:5514, or ``None`` when unbounded."""
+        return None
+
+    def _request_rgba(
+        self, bounds: tuple[float, float, float, float], width: int, height: int
+    ) -> np.ndarray:
+        """Fetch exactly ``width`` x ``height`` pixels covering lon/lat ``bounds``.
+
+        ``bounds`` is ``(west, south, east, north)`` in degrees.  Returns a
+        ``(4, height, width)`` uint8 array: red, green, blue and an alpha band
+        that is 0 wherever the source has no imagery.
+        """
+        raise NotImplementedError
+
+    # --- provided --------------------------------------------------------
+
+    def read_rgba(self, grid: "RgbGrid", window: "RgbWindow") -> np.ndarray:
+        """Return the ``(4, height, width)`` RGBA pixels of ``window`` on ``grid``."""
+        if window.width <= 0 or window.height <= 0:
+            raise ResolutionMismatchError(
+                f"invalid block size {window.width}x{window.height} requested from "
+                f"{self.source_id}"
+            )
+        pieces = list(
+            split_pixels(
+                window.width, window.height, self.max_request_width_px, self.max_request_height_px
+            )
+        )
+        if len(pieces) > 1:
+            log.debug(
+                "%s: %d requests for %dx%d px window %s",
+                self.source_id,
+                len(pieces),
+                window.width,
+                window.height,
+                window,
+            )
+        mosaic = np.zeros((4, window.height, window.width), dtype=np.uint8)
+        for col_off, row_off, cols, rows in pieces:
+            sub = window.sub_window(col_off, row_off, cols, rows)
+            block = self._request_rgba(grid.window_bounds(sub), cols, rows)
+            mosaic[:, row_off : row_off + rows, col_off : col_off + cols] = block
+        return mosaic
 
 
 def _north_up_transform(bounds: ProjectedBounds, width: int, height: int):

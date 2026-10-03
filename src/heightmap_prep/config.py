@@ -39,6 +39,9 @@ WORLD_SUFFIXES = (".yaml", ".yml")
 #: The safety area frame whose points are absolute latitude/longitude degrees.
 LATLON_FRAME = "latlon_origin"
 
+#: ``world_origin.units`` values an origin can be given in.
+ORIGIN_UNITS = ("LATLON", "UTM")
+
 #: Vertical datum identifiers accepted on the command line and in the manifest.
 VERTICAL_DATUMS = ("egm96", "wgs84-ellipsoid")
 
@@ -49,6 +52,20 @@ NOMINAL_GRID_ORIGIN = (-1_000_000.0, -800_000.0)
 
 
 @dataclass(frozen=True)
+class WorldOrigin:
+    """``mrs_uav_managers.world_origin`` as the world file gives it.
+
+    With ``units: LATLON``, ``x`` is the latitude and ``y`` the longitude; with
+    ``units: UTM`` they are the easting and northing in the UTM zone the world
+    lies in.
+    """
+
+    units: str
+    x: float
+    y: float
+
+
+@dataclass(frozen=True)
 class WorldConfig:
     """One world: a named safety area polygon."""
 
@@ -56,6 +73,12 @@ class WorldConfig:
     #: Safety area vertices as ``(lon, lat)`` degrees, in file order.
     points: tuple[tuple[float, float], ...]
     path: Path | None = None
+    #: The world origin, when the file gives a usable one.
+    origin: WorldOrigin | None = None
+    #: ``safety_area.vertical``: the frame ``min_z``/``max_z`` are given in.
+    vertical_frame: str | None = None
+    min_z: float | None = None
+    max_z: float | None = None
 
     def describe(self) -> str:
         """A short identifier used in log lines and error messages."""
@@ -70,6 +93,9 @@ class PrepareOptions:
 
     vertical_datum: str = "egm96"
     include_rgb: bool = False
+    #: North-south ground size of an RGB pixel, in metres.
+    rgb_resolution_m: float = 0.25
+    rgb_jpeg_quality: int = 90
     resolution_m: float = 2.0
     tile_size_px: int = 4096
     proj_data_dir: Path | None = None
@@ -106,6 +132,14 @@ class PrepareOptions:
             )
         if not self.resolution_m > 0:
             raise ConfigError(f"resolution_m must be positive, got {self.resolution_m}")
+        if not self.rgb_resolution_m > 0:
+            raise ConfigError(
+                f"rgb_resolution_m must be positive, got {self.rgb_resolution_m}"
+            )
+        if not 1 <= self.rgb_jpeg_quality <= 100:
+            raise ConfigError(
+                f"rgb_jpeg_quality must be between 1 and 100, got {self.rgb_jpeg_quality}"
+            )
         if self.tile_size_px <= 0:
             raise ConfigError(f"tile_size_px must be positive, got {self.tile_size_px}")
         if self.block_size_px <= 0 or self.block_size_px % 16:
@@ -191,11 +225,45 @@ def parse_world(document: Any, path: Path) -> WorldConfig:
         )
     if "points" not in horizontal:
         raise ConfigError(f"{path}: safety area has no 'points'")
+    vertical = document["mrs_uav_managers"]["safety_area_manager"]["safety_area"].get("vertical")
+    vertical = vertical if isinstance(vertical, dict) else {}
+    frame_name = vertical.get("frame_name")
     return WorldConfig(
         name=world_name_from_path(path),
         points=_latlon_pairs(horizontal["points"], path),
         path=path,
+        origin=_world_origin(document["mrs_uav_managers"].get("world_origin"), path),
+        vertical_frame=str(frame_name).strip() if frame_name is not None else None,
+        min_z=_optional_number(vertical.get("min_z")),
+        max_z=_optional_number(vertical.get("max_z")),
     )
+
+
+def _optional_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(float(value)) else None
+
+
+def _world_origin(section: Any, path: Path) -> WorldOrigin | None:
+    """The world origin, or ``None`` (with a debug note) when it is unusable.
+
+    The origin only describes the world; the dataset does not depend on it, so a
+    missing or malformed one never makes a world config unusable.
+    """
+    if not isinstance(section, dict):
+        log.debug("%s: no world_origin section", path)
+        return None
+    units = str(section.get("units", "")).strip().upper()
+    x = _optional_number(section.get("origin_x"))
+    y = _optional_number(section.get("origin_y"))
+    if units not in ORIGIN_UNITS or x is None or y is None:
+        log.debug("%s: world_origin %r is not usable", path, section)
+        return None
+    if units == "LATLON" and not (-90.0 <= x <= 90.0 and -180.0 <= y <= 180.0):
+        log.debug("%s: world_origin (%r, %r) is not a valid latitude/longitude", path, x, y)
+        return None
+    return WorldOrigin(units=units, x=x, y=y)
 
 
 def load_world(path: Path) -> WorldConfig:

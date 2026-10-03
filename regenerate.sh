@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Regenerate the dataset bundled into heightmap_sampler from the world configs
-# in worlds/, then commit src/heightmap_sampler/dataset.
+# Regenerate dataset/ from the world configs in worlds/, then commit it.
+# heightmap_sampler bundles it through its src/heightmap_sampler/dataset symlink.
 #
 #   ./regenerate.sh                 # extra arguments go to heightmap-prep,
 #   ./regenerate.sh --workers 4     # e.g. --workers or --log-level debug
 #
-# The first run creates .venv and downloads the PROJ grids.  Downloaded source
-# rasters are cached in cache/, so regenerating after a small change is quick.
+# The dataset includes the ČÚZK orthophoto (rgb/) and the worlds database
+# (worlds.sqlite).  The first run creates .venv and downloads the PROJ grids.
+# Downloaded source rasters and imagery are cached in cache/, so regenerating
+# after a small change is quick.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-DATASET=src/heightmap_sampler/dataset
+DATASET=dataset
 VERTICAL_DATUM=wgs84-ellipsoid
 
 source scripts/python_env.sh
@@ -25,6 +27,7 @@ trap 'rm -rf "$staging"' EXIT
   --vertical-datum "$VERTICAL_DATUM" \
   --proj-data-dir .proj \
   --cache-dir cache \
+  --include-rgb \
   "$@"
 
 rm -rf "$DATASET"

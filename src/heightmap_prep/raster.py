@@ -15,6 +15,7 @@ from typing import Callable, Mapping
 
 import numpy as np
 import rasterio
+import rasterio.windows
 from affine import Affine
 from rasterio.crs import CRS as RioCRS
 
@@ -44,6 +45,19 @@ TAG_RESOLUTION = "HEIGHTMAP_PREP_RESOLUTION_M"
 
 #: Bumped whenever generated pixel values could change for identical inputs.
 PROCESSING_VERSION = "1"
+
+#: RGB tile provenance, next to the shared package/processing/source tags.
+TAG_RGB_RESOLUTION = "HEIGHTMAP_PREP_RGB_RESOLUTION_M"
+TAG_RGB_JPEG_QUALITY = "HEIGHTMAP_PREP_RGB_JPEG_QUALITY"
+#: The lattice window that holds imagery, as ``col,row,width,height``.
+TAG_RGB_FILLED = "HEIGHTMAP_PREP_RGB_FILLED"
+
+#: Bumped whenever generated RGB pixels could change for identical inputs.
+RGB_PROCESSING_VERSION = "1"
+
+#: Internal block edge of RGB tiles.  RGB tiles are tens of thousands of pixels
+#: across, so larger blocks keep the (mostly empty) block index small.
+RGB_BLOCK_PX = 512
 
 
 def storage_profile(
@@ -151,6 +165,86 @@ def write_raster_atomic(
     tmp.unlink(missing_ok=True)
     try:
         write_raster(tmp, data, **kwargs)  # type: ignore[arg-type]
+        if validate is not None:
+            validate(tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def rgb_storage_profile(
+    *,
+    width: int,
+    height: int,
+    transform: Affine,
+    crs: str | RioCRS,
+    jpeg_quality: int = 90,
+    block_size_px: int = RGB_BLOCK_PX,
+) -> dict[str, object]:
+    """Three-band uint8 YCbCr JPEG, tiled and sparse; validity is an internal mask."""
+    return {
+        "driver": "GTiff",
+        "dtype": "uint8",
+        "count": 3,
+        "width": int(width),
+        "height": int(height),
+        "transform": transform,
+        "crs": RioCRS.from_user_input(crs) if isinstance(crs, str) else crs,
+        "tiled": True,
+        "blockxsize": int(block_size_px),
+        "blockysize": int(block_size_px),
+        "interleave": "pixel",
+        "photometric": "ycbcr",
+        "compress": "jpeg",
+        "jpeg_quality": int(jpeg_quality),
+        # Blocks nobody writes are left out of the file entirely.
+        "sparse_ok": True,
+        "BIGTIFF": "IF_SAFER",
+    }
+
+
+def write_rgb_window_atomic(
+    path: Path,
+    rgba: np.ndarray,
+    *,
+    profile: Mapping[str, object],
+    col_off: int,
+    row_off: int,
+    overwrite: bool = False,
+    validate: Callable[[Path], None] | None = None,
+    tags: Mapping[str, str] | None = None,
+) -> Path:
+    """Write ``rgba`` into a window of an otherwise empty RGB tile, atomically.
+
+    The tile is created at its full size, but only the window is written: the
+    rest stays sparse and masked out, so a tile far larger than memory costs
+    only what its imagery does.  Alpha becomes the internal mask.  Otherwise
+    like :func:`write_raster_atomic`.
+    """
+    rgba = np.asarray(rgba)
+    if rgba.ndim != 3 or rgba.shape[0] != 4 or rgba.dtype != np.uint8:
+        raise MalformedRasterError(
+            f"expected a (4, height, width) uint8 RGBA array, got {rgba.dtype} {rgba.shape}"
+        )
+    path = Path(path)
+    if path.exists() and not overwrite:
+        raise OutputConflictError(
+            f"{path} already exists; pass --overwrite to replace it"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    window = rasterio.windows.Window(col_off, row_off, rgba.shape[2], rgba.shape[1])
+    valid = rgba[3] > 0
+    try:
+        with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True):
+            with rasterio.open(tmp, "w", **profile) as dataset:
+                dataset.write(np.where(valid, rgba[:3], 0).astype(np.uint8), window=window)
+                dataset.write_mask(np.where(valid, 255, 0).astype(np.uint8), window=window)
+                if tags:
+                    dataset.update_tags(**{k: str(v) for k, v in tags.items()})
         if validate is not None:
             validate(tmp)
         os.replace(tmp, path)

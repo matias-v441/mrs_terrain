@@ -206,6 +206,8 @@ def test_option_defaults_match_the_specification() -> None:
     options = PrepareOptions()
     assert options.vertical_datum == "egm96"
     assert options.include_rgb is False
+    assert options.rgb_resolution_m == 0.25
+    assert options.rgb_jpeg_quality == 90
     assert options.resolution_m == 2.0
     assert options.tile_size_px == 4096
     assert options.block_size_px == 256
@@ -222,6 +224,9 @@ def test_option_defaults_match_the_specification() -> None:
         ({"tile_size_px": 0}, "tile_size_px must be positive"),
         ({"block_size_px": 100}, "multiple of 16"),
         ({"workers": 0}, "workers must be at least 1"),
+        ({"rgb_resolution_m": -1.0}, "rgb_resolution_m must be positive"),
+        ({"rgb_jpeg_quality": 0}, "rgb_jpeg_quality must be between"),
+        ({"rgb_jpeg_quality": 101}, "rgb_jpeg_quality must be between"),
     ],
 )
 def test_invalid_options_are_rejected(kwargs: dict, message: str) -> None:

@@ -47,12 +47,14 @@ The public header is a pimpl, so GDAL and yaml-cpp stay inside this package.
 
 ## The dataset
 
-The dataset ships **inside this package**. It is committed in `dataset/`, is
-installed to `share/heightmap_sampler/dataset`, and is what a default-constructed
+The dataset ships **inside this package**. It is committed in the
+repository's top-level `dataset/`, which this package reaches through its
+`dataset` symlink (`dataset -> ../../dataset`). It is installed to
+`share/heightmap_sampler/dataset`, and is what a default-constructed
 `HeightSampler` reads. It covers the safety areas of the worlds in the
 repository's `worlds/`, with heights on the WGS84 ellipsoid. After changing
-those worlds, run `./regenerate.sh` from the repository root and commit the
-result.
+those worlds, run `./regenerate.sh` from the repository root and commit
+`dataset/`.
 
 To bundle a different dataset instead, point the build at it:
 
@@ -125,7 +127,7 @@ on the bundled dataset. By hand:
 
 ```bash
 source <workspace>/install/setup.bash
-.venv/bin/python src/heightmap_sampler/test/parity_check.py src/heightmap_sampler/dataset
+.venv/bin/python src/heightmap_sampler/test/parity_check.py dataset
 ```
 
 It first checks that both this library and the Python reference reproduce every

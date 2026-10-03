@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from heightmap_prep.cuzk import NATIVE_GRID_ORIGIN_X, NATIVE_GRID_ORIGIN_Y
-from heightmap_prep.sources import BaseHeightSource
+from heightmap_prep.sources import BaseHeightSource, BaseRgbSource
 from heightmap_prep.tiling import ProjectedBounds
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -129,6 +129,63 @@ class SyntheticSource(BaseHeightSource):
 @pytest.fixture
 def synthetic_source() -> SyntheticSource:
     return SyntheticSource()
+
+
+class SyntheticRgbSource(BaseRgbSource):
+    """A deterministic stand-in for the ČÚZK orthophoto service.
+
+    Colours are a function of each pixel centre's lon/lat, so a test can tell
+    exactly which pixel ended up where.  ``hole`` is a lon/lat box without
+    imagery (alpha 0).
+    """
+
+    def __init__(
+        self,
+        *,
+        max_request_px: int = 4096,
+        coverage: ProjectedBounds | None = None,
+        hole: tuple[float, float, float, float] | None = None,
+    ) -> None:
+        self.max_request_width_px = max_request_px
+        self.max_request_height_px = max_request_px
+        self._coverage = coverage
+        self.hole = hole
+        self.requests: list[tuple[tuple[float, float, float, float], int, int]] = []
+
+    @property
+    def source_id(self) -> str:
+        return "synthetic-rgb"
+
+    def coverage(self) -> ProjectedBounds | None:
+        return self._coverage
+
+    @staticmethod
+    def colour_at(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+        """``(3, ...)`` uint8: red follows longitude, green latitude.
+
+        Smooth, with a period of a few tens of metres, so JPEG keeps it closely.
+        """
+        red = 128.0 + 100.0 * np.sin(np.asarray(lon) * 1e4)
+        green = 128.0 + 100.0 * np.cos(np.asarray(lat) * 1.5e4)
+        blue = np.full(np.broadcast(lon, lat).shape, 128.0)
+        return np.stack(np.broadcast_arrays(red, green, blue)).round().astype(np.uint8)
+
+    def _request_rgba(self, bounds, width: int, height: int) -> np.ndarray:
+        self.requests.append((bounds, width, height))
+        west, south, east, north = bounds
+        lons = west + (np.arange(width) + 0.5) * (east - west) / width
+        lats = north - (np.arange(height) + 0.5) * (north - south) / height
+        lon, lat = np.meshgrid(lons, lats)
+        alpha = np.full((1, height, width), 255, dtype=np.uint8)
+        if self.hole is not None:
+            hw, hs, he, hn = self.hole
+            alpha[0][(lon >= hw) & (lon <= he) & (lat >= hs) & (lat <= hn)] = 0
+        return np.concatenate([self.colour_at(lon, lat), alpha])
+
+
+@pytest.fixture
+def synthetic_rgb_source() -> SyntheticRgbSource:
+    return SyntheticRgbSource()
 
 
 def mrs_world(points: str, frame: str = "latlon_origin") -> str:

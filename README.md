@@ -6,8 +6,9 @@ coordinates, and samples them from ROS 2.
 ## Quick start
 
 Clone this repository into a ROS 2 Jazzy workspace and build it. The dataset
-covering the worlds in [`worlds/`](worlds) is committed inside the
-`heightmap_sampler` package, so nothing needs to be configured or downloaded:
+covering the worlds in [`worlds/`](worlds) is committed in [`dataset/`](dataset),
+which the `heightmap_sampler` package links to and bundles, so nothing needs to
+be configured or downloaded:
 
 ```bash
 cd ~/ros2_ws/src
@@ -31,13 +32,29 @@ Heights are WGS84 ellipsoidal metres, the datum `regenerate.sh` prepares. A
 point outside the worlds' safety areas may have no height. There is also a ROS
 service node; see [the package README](src/heightmap_sampler/README.md).
 
+The dataset also holds orthophoto imagery of every world and a database of the
+worlds (safety area, origin, tiles). From Python:
+
+```python
+from heightmap_prep.world_dataset import WorldDataset
+
+with WorldDataset("dataset") as dataset:
+    dataset.world_names()                      # ['bechovice', 'brandysek', ...]
+    world = dataset.world("temesvar_field")    # safety area, origin, min/max z, tiles
+    image = dataset.read_rgb("temesvar_field", margin_m=10)   # RGB + mask, EPSG:4326
+```
+
+or `heightmap-worlds dataset temesvar_field --export field.tif`.
+See [Reading worlds back](#reading-worlds-back).
+
 ### Adding or changing a world
 
 1. Put the world's MRS world config in `worlds/`. Its safety area must be given
    in `latlon_origin`.
 2. Run `./regenerate.sh`. The first run sets up `.venv` and downloads the PROJ
-   grids; elevation data comes from the ČÚZK service, so it needs the internet.
-3. Commit `src/heightmap_sampler/dataset` and rebuild the workspace.
+   grids; elevation data and imagery come from the ČÚZK services, so it needs
+   the internet.
+3. Commit `dataset/` and rebuild the workspace.
 
 ### Running the tests
 
@@ -126,7 +143,9 @@ heightmap-prep ./prepared --validate-only
 | `--workers INTEGER` | `1` | Bounded parallel tile processing |
 | `--overwrite` | off | Replace existing tiles instead of reusing them |
 | `--validate-only` | off | Validate an existing dataset, no network |
-| `--include-rgb` | off | Accepted; RGB acquisition is not implemented in v1 |
+| `--include-rgb` | off | Also prepare orthophoto tiles in EPSG:4326, see [RGB imagery](#rgb-imagery) |
+| `--rgb-resolution FLOAT` | `0.25` | North-south ground size of an RGB pixel in metres |
+| `--rgb-jpeg-quality INTEGER` | `90` | JPEG quality of the RGB tiles |
 | `--log-level` | `info` | `debug` also logs request URLs, tile transforms, PROJ operations |
 
 Advanced knobs (`--block-size`, `--nodata`, `--grid-origin`, `--max-request-px`,
@@ -201,7 +220,8 @@ result = prepare_worlds(
 print(result.manifest.tiles, result.report.ok)
 ```
 
-`prepare_worlds` also accepts `source=` to substitute the acquisition backend.
+`prepare_worlds` also accepts `source=` and `rgb_source=` to substitute the
+height and imagery acquisition backends.
 
 ## Output
 
@@ -209,11 +229,14 @@ print(result.manifest.tiles, result.report.ok)
 OUTPUT_DIR/
     dataset.yaml
     test_points.csv
+    worlds.sqlite
     height/
+        tile_<ix>_<iy>.tif
+    rgb/                      # with --include-rgb
         tile_<ix>_<iy>.tif
 ```
 
-Tiles are single-band `float32`, `deflate`-compressed with `predictor=3`,
+Height tiles are single-band `float32`, `deflate`-compressed with `predictor=3`,
 internally tiled at 256×256, with NoData `-9999.0`.
 
 ### Test points
@@ -290,6 +313,81 @@ Tiles carry no halo, so a sampler doing bilinear interpolation near a tile edge
 must load the neighbouring tile. `examples/sampler.py` is a ~100-line reference
 implementation of the whole runtime path.
 
+### RGB imagery
+
+With `--include-rgb`, every height tile `(ix, iy)` gets an RGB tile with the
+same index in `rgb/`, holding the [ČÚZK orthophoto](https://ags.cuzk.gov.cz/arcgis1/rest/services/ORTOFOTO/MapServer)
+in the query CRS, EPSG:4326. The service renders the imagery in EPSG:4326 itself,
+S-JTSK → WGS84 datum shift included; checked against a local PROJ warp of its
+EPSG:5514 output, the two agree to within a pixel.
+
+* **Lattice.** All RGB tiles are windows of one global lattice of square-degree
+  pixels anchored at (-180°, 90°), so overlapping tiles hold identical pixels.
+  `--rgb-resolution` is the north-south pixel size; at Czech latitudes pixels
+  are about 0.65 of that east-west. Square-degree pixels are what the ArcGIS
+  `export` operation renders.
+* **Extent.** RGB tile `(ix, iy)` covers the EPSG:4326 bounding box of height
+  tile `(ix, iy)` grown by half a height pixel, snapped outward to the lattice.
+  To find the imagery at a lon/lat, find the height tile as usual, open the RGB
+  tile with the same index and use its own geotransform. Krovak East North is
+  rotated against the meridians, so neighbouring RGB tiles overlap slightly.
+* **Content.** Like height tiles, only the area the worlds need is fetched: the
+  bounding box of each world's height pixels in that tile. The rest of the tile
+  is masked out and, since the files are sparse, takes no space.
+* **Storage.** Three-band `uint8` GeoTIFF, JPEG (YCbCr) at `--rgb-jpeg-quality`,
+  512×512 blocks, with an internal mask marking where there is imagery. The
+  `rgb:` section of `dataset.yaml` records all of it.
+
+### Worlds database
+
+`worlds.sqlite` records every world the dataset was prepared for, so a
+consumer does not need the world files. Coordinates are WGS84 degrees.
+
+| Table | Contents |
+| --- | --- |
+| `worlds` | `name`, `source_file`, the world origin as given (`origin_units`, `origin_x`, `origin_y`) and in degrees (`origin_lat`, `origin_lon`), `safety_area_frame`, `vertical_frame`, `min_z`, `max_z`, `safety_area_wkt` |
+| `safety_area_vertices` | `world`, `seq`, `lat`, `lon`, in world-file order |
+| `tiles` | `ix`, `iy`, `height_path`, `rgb_path`, `rgb_west`/`south`/`east`/`north` |
+| `world_tiles` | `world`, `ix`, `iy`: the tiles each world needs |
+| `meta` | schema version, query CRS, tile patterns |
+
+A UTM world origin has no zone, so it is placed in the UTM zone of the safety
+area. `PRAGMA user_version` is the schema version, which `dataset.yaml` repeats
+under `worlds_db:`. The database is rebuilt from scratch on every run, and a
+rebuild of the same dataset is byte-identical.
+
+### Reading worlds back
+
+`heightmap_prep.world_dataset` reads a prepared dataset. It needs neither the
+network nor PROJ grids:
+
+```python
+from heightmap_prep.world_dataset import WorldDataset
+
+with WorldDataset("prepared") as dataset:
+    for name in dataset.world_names():
+        world = dataset.world(name)
+        world.safety_area          # ((lat, lon), ...)
+        world.origin               # Origin(units, x, y, lat, lon) or None
+        world.min_z, world.max_z   # vertical safety limits, in world.vertical_frame
+        world.tiles                # (TileIndex, ...)
+    dataset.rgb_tiles("bechovice")             # [RgbTile(tile, path, bounds), ...]
+    image = dataset.read_rgb("bechovice", margin_m=5)
+    image.data, image.mask, image.transform    # (3, h, w) uint8, (h, w) bool, EPSG:4326
+    image.write("bechovice.tif")
+```
+
+`read_rgb` mosaics the world's RGB tiles and crops them to the bounding box of
+its safety area, grown by `margin_m`. The tiles only hold imagery a few metres
+beyond the safety area (further where other worlds are near), so a wide margin
+comes back partly masked. The same is available from the shell:
+
+```bash
+heightmap-worlds prepared                     # list the worlds
+heightmap-worlds prepared bechovice           # describe one
+heightmap-worlds prepared bechovice --export bechovice.tif --margin 5
+```
+
 ## Sampling from C++
 
 [`src/heightmap_sampler`](src/heightmap_sampler) is a ROS 2 Jazzy package that
@@ -313,7 +411,10 @@ validated, and only then renamed into place, so an interrupted run never leaves
 a truncated file that a later run would trust. Tiles carry their provenance as
 GDAL metadata (source id, vertical datum, resolution, processing version) and
 are reused on a later run only when all of it matches and the file still
-validates. A mismatch is an error unless `--overwrite` is given.
+validates. A mismatch is an error unless `--overwrite` is given. RGB tiles also
+record which part of them holds imagery, and are reused only when that covers
+what the worlds now need, so adding a world to an existing RGB tile needs
+`--overwrite`.
 
 The manifest is `status: building` during generation and `status: complete`
 afterwards. A run that fails before writing anything restores the previous
@@ -336,7 +437,12 @@ Nothing is published before it has been checked:
   ballpark-only operations are rejected;
 * **plausibility** — elevations outside the Czech range, all-zero tiles, tiles
   with no data at all and a suspiciously unchanged conversion produce
-  *warnings* only, and never replace the CRS-level checks.
+  *warnings* only, and never replace the CRS-level checks;
+* **each RGB tile** — EPSG:4326, three `uint8` bands with an internal mask, on
+  the lattice, covering its height tile, with imagery where it was fetched (a
+  warning if under 99 % of it);
+* **worlds database** — schema version, the same worlds and tiles as the
+  manifest, at least three safety area vertices per world.
 
 ## Coordinate reference systems
 
@@ -376,6 +482,7 @@ skipped unless the PROJ grids are present in `./.proj` or at
 
 ## Not implemented in version 1
 
-RGB imagery (`--include-rgb` is accepted and warns), LAZ/PDAL input, local
-GeoTIFF input, EGM2008 and EVRF2007 outputs, and Zarr storage. The `HeightSource` adapter protocol in `sources.py` is the extension
-point for new inputs; the storage design does not need to change for any of them.
+LAZ/PDAL input, local GeoTIFF input, EGM2008 and EVRF2007 outputs, and Zarr
+storage. The `HeightSource` adapter protocol in `sources.py` is the extension
+point for new inputs (`BaseRgbSource` for imagery); the storage design does not
+need to change for any of them.

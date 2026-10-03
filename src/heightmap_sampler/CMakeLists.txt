@@ -67,8 +67,9 @@ target_link_libraries(sample_height PRIVATE heightmap_sampler)
 # --- the dataset --------------------------------------------------------
 #
 # The dataset ships inside this package, so a default-constructed
-# HeightSampler needs no path from the caller.  Which dataset that is, is a
-# build-time decision:
+# HeightSampler needs no path from the caller.  By default it is the
+# repository's top-level dataset/, which ./dataset links to.  Which dataset
+# that is, is a build-time decision:
 #
 #   colcon build --packages-up-to heightmap_sampler --cmake-args \
 #     -DHEIGHTMAP_SAMPLER_DATASET_DIR=/path/to/prepared
@@ -76,9 +77,21 @@ target_link_libraries(sample_height PRIVATE heightmap_sampler)
 set(HEIGHTMAP_SAMPLER_DATASET_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dataset"
     CACHE PATH "Prepared dataset to install into this package's share directory")
 
-if(EXISTS "${HEIGHTMAP_SAMPLER_DATASET_DIR}/dataset.yaml")
-  message(STATUS "heightmap_sampler: bundling dataset ${HEIGHTMAP_SAMPLER_DATASET_DIR}")
-  install(DIRECTORY "${HEIGHTMAP_SAMPLER_DATASET_DIR}/"
+# The dataset is committed in the repository root; this package links to it via
+# a symlink (dataset -> ../../dataset).  On all platforms, CMake should resolve
+# the symlink to the real location before installing it.
+get_filename_component(_heightmap_sampler_dataset "${HEIGHTMAP_SAMPLER_DATASET_DIR}" REALPATH)
+
+# On Windows with core.symlinks=false, git stores the symlink as a text file.
+# If REALPATH didn't resolve it, try the fallback path.
+if(NOT EXISTS "${_heightmap_sampler_dataset}/dataset.yaml")
+  get_filename_component(_heightmap_sampler_dataset
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../dataset" REALPATH)
+endif()
+
+if(EXISTS "${_heightmap_sampler_dataset}/dataset.yaml")
+  message(STATUS "heightmap_sampler: bundling dataset ${_heightmap_sampler_dataset}")
+  install(DIRECTORY "${_heightmap_sampler_dataset}/"
           DESTINATION share/${PROJECT_NAME}/dataset)
 else()
   message(WARNING

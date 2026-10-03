@@ -82,13 +82,13 @@ tiles:
 software:
   package_version: 1.0.0
   python_version: 3.12.3
-  rasterio_version: 1.5.1
-  gdal_version: 3.12.4
+  rasterio_version: 1.5.2
+  gdal_version: 3.12.2
   pyproj_version: 3.8.0
   proj_version: 9.8.1
 processing:
-  created_utc: '2026-09-29T14:49:02Z'
-  updated_utc: '2026-09-29T14:49:11Z'
+  created_utc: '2026-10-03T17:52:53Z'
+  updated_utc: '2026-10-03T17:53:01Z'
   interpolation: nearest
   vertical_conversion: proj
   processing_version: '1'
@@ -99,3 +99,37 @@ test_points:
   - lat
   - lon
   - height
+rgb:
+  crs: EPSG:4326
+  bands:
+  - red
+  - green
+  - blue
+  dtype: uint8
+  mask: internal
+  resolution_m: 0.25
+  resolution_deg: 2.2457779374775424e-06
+  lattice_origin_lon: -180.0
+  lattice_origin_lat: 90.0
+  tile_pattern: rgb/tile_{ix}_{iy}.tif
+  tile_extent: rgb tile (ix, iy) covers the EPSG:4326 bounding box of height tile
+    (ix, iy) grown by half a height pixel, snapped outward to the lattice; find it
+    as for the height tile, then locate pixels with its own geotransform. Only pixels
+    around the safety areas hold imagery; the internal mask marks them.
+  storage:
+    format: geotiff
+    compression: jpeg
+    photometric: ycbcr
+    jpeg_quality: 90
+    block_width_px: 512
+    block_height_px: 512
+  source:
+    provider: CUZK
+    product: ORTOFOTO
+    source_id: cuzk-ortofoto
+    reprojection: server
+    service_url: https://ags.cuzk.gov.cz/arcgis1/rest/services/ORTOFOTO/MapServer
+  processing_version: '1'
+worlds_db:
+  path: worlds.sqlite
+  schema_version: 1

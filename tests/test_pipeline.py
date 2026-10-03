@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import rasterio
+import rasterio.windows
 import yaml
 from pyproj import Transformer
 
@@ -31,7 +32,14 @@ from heightmap_prep.raster import TAG_SOURCE_ID, TAG_VERTICAL_DATUM, read_tags
 from heightmap_prep.sampling import DatasetSampler, read_test_points
 from heightmap_prep.tiling import ProjectedBounds, TileGrid, TileIndex
 
-from conftest import REPO_ROOT, SECOND_WORLD_POINTS, TEST_AREA, SyntheticSource, mrs_world
+from conftest import (
+    REPO_ROOT,
+    SECOND_WORLD_POINTS,
+    TEST_AREA,
+    SyntheticRgbSource,
+    SyntheticSource,
+    mrs_world,
+)
 
 TILE_PX = 128
 
@@ -701,3 +709,159 @@ def test_a_bad_world_config_is_skipped(
     )
     assert result.manifest.worlds == ["testworld"]
     assert set(result.skipped) == {broken, missing}
+
+
+# --- RGB imagery and the worlds database -------------------------------------
+
+
+def run_rgb(world_files, out: Path, proj_dir: Path, rgb_source=None, **overrides):
+    overrides.setdefault("rgb_resolution_m", 1.0)
+    return prepare_worlds(
+        list(world_files),
+        out,
+        options(proj_dir, include_rgb=True, **overrides),
+        source=SyntheticSource(),
+        rgb_source=rgb_source or SyntheticRgbSource(),
+    )
+
+
+def test_every_height_tile_gets_a_validated_rgb_tile(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    out = tmp_path / "out"
+    result = run_rgb([world_file], out, proj_dir)
+    assert result.report.ok, result.report.errors
+    assert {o.tile for o in result.rgb_outcomes} == set(result.manifest.tiles)
+    assert result.report.tiles_checked == 2 * len(result.manifest.tiles)
+
+    manifest = Manifest.read(out)
+    assert manifest.rgb is not None and manifest.rgb.crs == "EPSG:4326"
+    assert manifest.rgb.resolution_m == 1.0
+    for tile in manifest.tiles:
+        with rasterio.open(manifest.rgb_tile_path(out, tile)) as dataset:
+            assert dataset.crs.to_epsg() == 4326
+            assert (dataset.count, dataset.dtypes[0]) == (3, "uint8")
+            assert manifest.rgb.grid().window_of_transform(
+                dataset.transform, dataset.width, dataset.height
+            ) == manifest.rgb.grid().tile_window(manifest.grid(), tile)
+    assert validate_only(out).ok
+
+
+def test_rgb_imagery_covers_the_whole_safety_area(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    out = tmp_path / "out"
+    run_rgb([world_file], out, proj_dir)
+    manifest = Manifest.read(out)
+    world = load_world(world_file)
+    for lon, lat in polygon_samples(world):
+        x, y = Transformer.from_crs("EPSG:4326", "EPSG:5514", always_xy=True).transform(lon, lat)
+        tile = manifest.grid().index_for_point(x, y)
+        with rasterio.open(manifest.rgb_tile_path(out, tile)) as dataset:
+            row, col = dataset.index(lon, lat)
+            window = rasterio.windows.Window(col, row, 1, 1)
+            assert dataset.read_masks(1, window=window)[0, 0] == 255
+            pixel = dataset.read(window=window)[:, 0, 0].astype(int)
+        expected = SyntheticRgbSource.colour_at(*dataset.xy(row, col)).astype(int)
+        assert np.abs(pixel - expected).max() <= 6  # JPEG
+
+
+def test_a_second_rgb_run_reuses_every_rgb_tile(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    out = tmp_path / "out"
+    first = run_rgb([world_file], out, proj_dir)
+    rgb = SyntheticRgbSource()
+    second = run_rgb([world_file], out, proj_dir, rgb_source=rgb)
+    assert {o.action for o in second.rgb_outcomes} == {"reused"}
+    assert len(second.rgb_outcomes) == len(first.rgb_outcomes)
+    assert rgb.requests == []
+
+
+def test_a_new_world_in_an_rgb_tile_needs_overwrite(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    out = tmp_path / "out"
+    run_rgb([world_file], out, proj_dir)
+    second = tmp_path / "world_second.yaml"
+    second.write_text(mrs_world(SECOND_WORLD_POINTS), encoding="utf-8")
+    with pytest.raises(OutputConflictError, match="less than the worlds now need"):
+        run_rgb([world_file, second], out, proj_dir)
+    result = run_rgb([world_file, second], out, proj_dir, overwrite=True)
+    assert result.report.ok, result.report.errors
+    assert {o.action for o in result.rgb_outcomes} == {"written"}
+
+
+def test_a_different_rgb_resolution_without_overwrite_is_refused(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    out = tmp_path / "out"
+    run_rgb([world_file], out, proj_dir)
+    with pytest.raises(OutputConflictError, match="RGB_RESOLUTION"):
+        run_rgb([world_file], out, proj_dir, rgb_resolution_m=2.0)
+
+
+def test_a_missing_rgb_tile_fails_validation(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    out = tmp_path / "out"
+    result = run_rgb([world_file], out, proj_dir)
+    result.manifest.rgb_tile_path(out, result.manifest.tiles[0]).unlink()
+    report = validate_only(out)
+    assert not report.ok and any("rgb tile" in e for e in report.errors)
+
+
+def test_rgb_tiles_only_skipped_worlds_needed_are_removed(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    lonely = write_world(tmp_path / "world_lonely.yaml", LONELY)
+    hole = ProjectedBounds(-742_700.0, -1_044_480.0, -742_500.0, -1_044_320.0)
+    out = tmp_path / "out"
+    result = prepare_worlds(
+        [world_file, lonely],
+        out,
+        options(proj_dir, include_rgb=True, rgb_resolution_m=1.0),
+        source=SyntheticSource(nodata_region=hole),
+        rgb_source=SyntheticRgbSource(),
+    )
+    assert result.report.ok, result.report.errors
+    assert all(o.tile != LONELY_TILE for o in result.rgb_outcomes)
+    assert not (out / "rgb" / f"tile_{LONELY_TILE.ix}_{LONELY_TILE.iy}.tif").exists()
+    assert not validate_only(out).unexpected_files
+
+
+def test_a_world_outside_the_imagery_coverage_is_skipped(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    lonely = write_world(tmp_path / "world_lonely.yaml", LONELY)
+    # Imagery only for the north-west of the test area: not the lonely world.
+    coverage = ProjectedBounds(TEST_AREA.west, -1_044_300.0, -742_700.0, TEST_AREA.north)
+    result = run_rgb(
+        [world_file, lonely], tmp_path / "out", proj_dir,
+        rgb_source=SyntheticRgbSource(coverage=coverage),
+    )
+    assert result.manifest.worlds == ["testworld"]
+    assert "synthetic-rgb coverage" in result.skipped[lonely]
+
+
+def test_imagery_holes_are_masked_and_warned_about(
+    world_file: Path, tmp_path: Path, proj_dir: Path, caplog
+) -> None:
+    hole = (14.418, 50.077, 14.420, 50.079)
+    with caplog.at_level("WARNING"):
+        result = run_rgb(
+            [world_file], tmp_path / "out", proj_dir, rgb_source=SyntheticRgbSource(hole=hole)
+        )
+    assert result.report.ok
+    assert any("has imagery" in r.message for r in caplog.records)
+
+
+def test_the_worlds_database_is_written_without_rgb(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    out = tmp_path / "out"
+    result = run(world_file, out, proj_dir)
+    assert result.manifest.rgb is None
+    assert result.manifest.worlds_db_path == "worlds.sqlite"
+    assert (out / "worlds.sqlite").is_file()
+    assert not (out / "rgb").exists()
