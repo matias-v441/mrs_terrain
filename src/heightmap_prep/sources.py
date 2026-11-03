@@ -21,7 +21,7 @@ from .errors import OutOfCoverageError, ResolutionMismatchError
 from .tiling import ProjectedBounds
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .rgb import RgbGrid, RgbWindow
+    from .wgs import Lattice, LatticeWindow
 
 log = logging.getLogger(__name__)
 
@@ -212,7 +212,7 @@ def split_pixels(
 class BaseRgbSource:
     """Shared behaviour for imagery sources serving arbitrary EPSG:4326 windows.
 
-    Imagery is requested on the dataset's RGB pixel lattice (:class:`.rgb.RgbGrid`)
+    Imagery is requested on the dataset's RGB pixel lattice (:class:`.wgs.Lattice`)
     directly in the query CRS.  Subclasses implement :meth:`_request_rgba` for a
     single, already size-limited request; this base class splits a large window
     into several requests and stitches the results.
@@ -247,8 +247,8 @@ class BaseRgbSource:
 
     # --- provided --------------------------------------------------------
 
-    def read_rgba(self, grid: "RgbGrid", window: "RgbWindow") -> np.ndarray:
-        """Return the ``(4, height, width)`` RGBA pixels of ``window`` on ``grid``."""
+    def read_rgba(self, lattice: "Lattice", window: "LatticeWindow") -> np.ndarray:
+        """Return the ``(4, height, width)`` RGBA pixels of ``window`` on ``lattice``."""
         if window.width <= 0 or window.height <= 0:
             raise ResolutionMismatchError(
                 f"invalid block size {window.width}x{window.height} requested from "
@@ -271,7 +271,7 @@ class BaseRgbSource:
         mosaic = np.zeros((4, window.height, window.width), dtype=np.uint8)
         for col_off, row_off, cols, rows in pieces:
             sub = window.sub_window(col_off, row_off, cols, rows)
-            block = self._request_rgba(grid.window_bounds(sub), cols, rows)
+            block = self._request_rgba(lattice.window_bounds(sub), cols, rows)
             mosaic[:, row_off : row_off + rows, col_off : col_off + cols] = block
         return mosaic
 

@@ -14,6 +14,8 @@ from heightmap_prep.manifest import (
     STATUS_BUILDING,
     STATUS_COMPLETE,
     Manifest,
+    WgsInfo,
+    WgsRgbInfo,
     grid_file_checksums,
     software_versions,
 )
@@ -105,6 +107,32 @@ def test_test_points_round_trip(tmp_path: Path) -> None:
     assert (restored.test_points_path, restored.test_points_count) == ("test_points.csv", 12)
 
 
+def test_the_wgs_section_round_trips(tmp_path: Path) -> None:
+    original = sample()
+    original.wgs = WgsInfo(
+        resolution_m=0.25,
+        resolution_deg=0.25 / 111_320.0,
+        tiles=[TileIndex(10568, 2170), TileIndex(10567, 2170)],
+        rgb=WgsRgbInfo(source_id="cuzk-ortofoto", jpeg_quality=80),
+    )
+    original.write(tmp_path)
+    document = yaml.safe_load((tmp_path / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    section = document["wgs"]
+    assert section["tile_size_px"] == 8192 and section["height"]["tile_width_px"] == 1024
+    assert section["height"]["tile_pattern"] == "wgs/height/tile_{ix}_{iy}.tif"
+    assert section["rgb"]["tile_pattern"] == "wgs/rgb/tile_{ix}_{iy}.tif"
+    assert section["tiles"]["index"] == [[10567, 2170], [10568, 2170]]
+
+    restored = Manifest.read(tmp_path)
+    assert restored.wgs is not None and restored.wgs.rgb is not None
+    assert restored.wgs.grid() == original.wgs.grid()
+    assert restored.wgs.tiles == [TileIndex(10567, 2170), TileIndex(10568, 2170)]
+    assert restored.wgs.rgb.jpeg_quality == 80
+    assert restored.wgs_height_path(tmp_path, TileIndex(1, 2)) == (
+        tmp_path / "wgs" / "height" / "tile_1_2.tif"
+    )
+
+
 def test_the_manifest_has_no_bounds() -> None:
     document = sample().to_dict()
     assert "world_bounds_wgs84" not in document
@@ -119,7 +147,7 @@ def test_write_is_atomic_and_leaves_no_temporary(tmp_path: Path) -> None:
 
 def test_yaml_is_human_readable_and_ordered(tmp_path: Path) -> None:
     text = (sample().write(tmp_path)).read_text(encoding="utf-8")
-    assert text.startswith("format_version: 1\nstatus: building\n")
+    assert text.startswith("format_version: 2\nstatus: building\n")
     assert "!!python" not in text
     yaml.safe_load(text)
 

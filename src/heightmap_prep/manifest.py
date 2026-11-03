@@ -18,11 +18,20 @@ from typing import Any, Iterable, Sequence
 import yaml
 
 from .errors import ValidationError
-from .rgb import LATTICE_ORIGIN_LAT, LATTICE_ORIGIN_LON, RGB_CRS, RGB_TILE_PATTERN, RgbGrid
+from .wgs import (
+    DEFAULT_HEIGHT_FACTOR,
+    DEFAULT_TILE_SIZE_PX,
+    LATTICE_ORIGIN_LAT,
+    LATTICE_ORIGIN_LON,
+    WGS_CRS,
+    WGS_HEIGHT_TILE_PATTERN,
+    WGS_RGB_TILE_PATTERN,
+    WgsGrid,
+)
 from .tiling import TileGrid, TileIndex
 
 #: Only this manifest layout is understood.
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 MANIFEST_FILENAME = "dataset.yaml"
 
@@ -69,21 +78,25 @@ def grid_file_checksums(paths: Iterable[Path]) -> dict[str, str]:
     return checksums
 
 
-#: How RGB tile ``(ix, iy)`` relates to height tile ``(ix, iy)``.
-RGB_TILE_EXTENT = (
-    "rgb tile (ix, iy) covers the EPSG:4326 bounding box of height tile (ix, iy) "
-    "grown by half a height pixel, snapped outward to the lattice; find it as for "
-    "the height tile, then locate pixels with its own geotransform. Only pixels "
-    "around the safety areas hold imagery; the internal mask marks them."
+#: How WGS tiles are indexed; mirrors ``grid.index_convention``.
+WGS_INDEX_CONVENTION = (
+    "origin is the west/north edge of lattice pixel (0, 0); ix increases eastward, "
+    "iy increases southward; ix = floor((lon - lattice_origin_lon) / tile_span_deg), "
+    "iy = floor((lattice_origin_lat - lat) / tile_span_deg); tiles do not overlap, and "
+    "the height and rgb tiles of one index cover the same area"
+)
+
+#: How WGS height pixels are computed.
+WGS_HEIGHT_DERIVATION = (
+    "bilinear sample of the EPSG:5514 height tiles at each pixel centre, exactly as "
+    "the sampling contract defines; nodata where the sampler returns none"
 )
 
 
 @dataclass
-class RgbInfo:
-    """The ``rgb`` section: orthophoto tiles in the query CRS."""
+class WgsRgbInfo:
+    """The ``wgs.rgb`` section: orthophoto tiles on the RGB lattice."""
 
-    resolution_m: float
-    resolution_deg: float
     source_id: str
     source_service_url: str | None = None
     source_provider: str = "CUZK"
@@ -91,16 +104,10 @@ class RgbInfo:
     jpeg_quality: int = 90
     block_width_px: int = 512
     block_height_px: int = 512
-    crs: str = RGB_CRS
-    tile_pattern: str = RGB_TILE_PATTERN
-    origin_lon: float = LATTICE_ORIGIN_LON
-    origin_lat: float = LATTICE_ORIGIN_LAT
+    tile_pattern: str = WGS_RGB_TILE_PATTERN
     processing_version: str = "1"
 
-    def grid(self) -> RgbGrid:
-        return RgbGrid(self.resolution_deg, self.origin_lon, self.origin_lat)
-
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, grid: WgsGrid) -> dict[str, Any]:
         source: dict[str, Any] = {
             "provider": self.source_provider,
             "product": self.source_product,
@@ -110,16 +117,13 @@ class RgbInfo:
         if self.source_service_url:
             source["service_url"] = self.source_service_url
         return {
-            "crs": self.crs,
+            "resolution_deg": float(grid.resolution_deg),
+            "tile_width_px": int(grid.tile_size_px),
+            "tile_height_px": int(grid.tile_size_px),
+            "tile_pattern": self.tile_pattern,
             "bands": ["red", "green", "blue"],
             "dtype": "uint8",
             "mask": "internal",
-            "resolution_m": float(self.resolution_m),
-            "resolution_deg": float(self.resolution_deg),
-            "lattice_origin_lon": float(self.origin_lon),
-            "lattice_origin_lat": float(self.origin_lat),
-            "tile_pattern": self.tile_pattern,
-            "tile_extent": RGB_TILE_EXTENT,
             "storage": {
                 "format": "geotiff",
                 "compression": "jpeg",
@@ -133,17 +137,14 @@ class RgbInfo:
         }
 
     @classmethod
-    def from_dict(cls, section: Any, *, origin: str) -> "RgbInfo":
+    def from_dict(cls, section: Any, *, origin: str) -> "WgsRgbInfo":
         if not isinstance(section, dict):
-            raise ValidationError(f"{origin}: section 'rgb' must be a mapping")
+            raise ValidationError(f"{origin}: section 'wgs.rgb' must be a mapping")
+        if section.get("tile_pattern") is None:
+            raise ValidationError(f"{origin}: missing required key wgs.rgb.tile_pattern")
         storage = section.get("storage") or {}
         source = section.get("source") or {}
-        for key in ("resolution_m", "resolution_deg", "tile_pattern"):
-            if section.get(key) is None:
-                raise ValidationError(f"{origin}: missing required key rgb.{key}")
         return cls(
-            resolution_m=float(section["resolution_m"]),
-            resolution_deg=float(section["resolution_deg"]),
             source_id=str(source.get("source_id", "")),
             source_service_url=source.get("service_url"),
             source_provider=str(source.get("provider", "")),
@@ -151,12 +152,130 @@ class RgbInfo:
             jpeg_quality=int(storage.get("jpeg_quality", 90)),
             block_width_px=int(storage.get("block_width_px", 512)),
             block_height_px=int(storage.get("block_height_px", 512)),
-            crs=str(section.get("crs", RGB_CRS)),
             tile_pattern=str(section["tile_pattern"]),
-            origin_lon=float(section.get("lattice_origin_lon", LATTICE_ORIGIN_LON)),
-            origin_lat=float(section.get("lattice_origin_lat", LATTICE_ORIGIN_LAT)),
             processing_version=str(section.get("processing_version", "1")),
         )
+
+
+@dataclass
+class WgsInfo:
+    """The ``wgs`` section: disjoint EPSG:4326 tiles of heights and imagery."""
+
+    resolution_m: float
+    resolution_deg: float
+    tile_size_px: int = DEFAULT_TILE_SIZE_PX
+    height_factor: int = DEFAULT_HEIGHT_FACTOR
+    origin_lon: float = LATTICE_ORIGIN_LON
+    origin_lat: float = LATTICE_ORIGIN_LAT
+    crs: str = WGS_CRS
+    tiles: list[TileIndex] = field(default_factory=list)
+    height_tile_pattern: str = WGS_HEIGHT_TILE_PATTERN
+    height_block_px: int = 256
+    height_processing_version: str = "1"
+    #: Orthophoto tiles; ``None`` when not prepared.
+    rgb: WgsRgbInfo | None = None
+
+    def grid(self) -> WgsGrid:
+        return WgsGrid(
+            resolution_deg=self.resolution_deg,
+            tile_size_px=self.tile_size_px,
+            height_factor=self.height_factor,
+            origin_lon=self.origin_lon,
+            origin_lat=self.origin_lat,
+        )
+
+    def set_tiles(self, tiles: Sequence[TileIndex]) -> None:
+        self.tiles = sorted(set(tiles))
+
+    def to_dict(self, *, nodata: float, vertical_crs: str, vertical_datum: str) -> dict[str, Any]:
+        grid = self.grid()
+        section: dict[str, Any] = {
+            "crs": self.crs,
+            "lattice_origin_lon": float(self.origin_lon),
+            "lattice_origin_lat": float(self.origin_lat),
+            # Nominal north-south size of an RGB lattice pixel.
+            "resolution_m": float(self.resolution_m),
+            "resolution_deg": float(self.resolution_deg),
+            "tile_size_px": int(self.tile_size_px),
+            "tile_span_deg": float(grid.tile_span_deg),
+            "index_convention": WGS_INDEX_CONVENTION,
+            "height": {
+                "resolution_deg": float(grid.height.resolution_deg),
+                "height_factor": int(self.height_factor),
+                "tile_width_px": int(grid.height_tile_px),
+                "tile_height_px": int(grid.height_tile_px),
+                "tile_pattern": self.height_tile_pattern,
+                "dtype": "float32",
+                "unit": "m",
+                "nodata": float(nodata),
+                "vertical_crs": vertical_crs,
+                "vertical_datum": vertical_datum,
+                "derivation": WGS_HEIGHT_DERIVATION,
+                "storage": {
+                    "format": "geotiff",
+                    "compression": "deflate",
+                    "predictor": 3,
+                    "block_width_px": int(self.height_block_px),
+                    "block_height_px": int(self.height_block_px),
+                },
+                "processing_version": self.height_processing_version,
+            },
+        }
+        if self.rgb is not None:
+            section["rgb"] = self.rgb.to_dict(grid)
+        tiles = sorted(set(self.tiles))
+        section["tiles"] = {
+            "count": len(tiles),
+            "index": [[tile.ix, tile.iy] for tile in tiles],
+        }
+        return section
+
+    @classmethod
+    def from_dict(cls, section: Any, *, origin: str) -> "WgsInfo":
+        if not isinstance(section, dict):
+            raise ValidationError(f"{origin}: section 'wgs' must be a mapping")
+        height = section.get("height")
+        if not isinstance(height, dict):
+            raise ValidationError(f"{origin}: section 'wgs.height' must be a mapping")
+        for where, mapping, key in (
+            ("wgs", section, "resolution_m"),
+            ("wgs", section, "resolution_deg"),
+            ("wgs", section, "tile_size_px"),
+            ("wgs.height", height, "height_factor"),
+            ("wgs.height", height, "tile_pattern"),
+        ):
+            if mapping.get(key) is None:
+                raise ValidationError(f"{origin}: missing required key {where}.{key}")
+        storage = height.get("storage") or {}
+        return cls(
+            resolution_m=float(section["resolution_m"]),
+            resolution_deg=float(section["resolution_deg"]),
+            tile_size_px=int(section["tile_size_px"]),
+            height_factor=int(height["height_factor"]),
+            origin_lon=float(section.get("lattice_origin_lon", LATTICE_ORIGIN_LON)),
+            origin_lat=float(section.get("lattice_origin_lat", LATTICE_ORIGIN_LAT)),
+            crs=str(section.get("crs", WGS_CRS)),
+            tiles=_tile_index_list(section.get("tiles") or {}, origin=origin),
+            height_tile_pattern=str(height["tile_pattern"]),
+            height_block_px=int(storage.get("block_width_px", 256)),
+            height_processing_version=str(height.get("processing_version", "1")),
+            rgb=(
+                WgsRgbInfo.from_dict(section["rgb"], origin=origin)
+                if section.get("rgb") is not None
+                else None
+            ),
+        )
+
+
+def _tile_index_list(section: Any, *, origin: str) -> list[TileIndex]:
+    if not isinstance(section, dict):
+        raise ValidationError(f"{origin}: a 'tiles' section must be a mapping")
+    tiles: list[TileIndex] = []
+    for entry in section.get("index", []) or []:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            raise ValidationError(f"{origin}: malformed tile index entry {entry!r}")
+        tiles.append(TileIndex(int(entry[0]), int(entry[1])))
+    return tiles
 
 
 @dataclass
@@ -215,8 +334,8 @@ class Manifest:
     #: relative to the dataset directory.
     test_points_path: str | None = None
     test_points_count: int = 0
-    #: Orthophoto tiles, one per height tile; ``None`` when not prepared.
-    rgb: RgbInfo | None = None
+    #: The EPSG:4326 tiles; ``None`` for a dataset of EPSG:5514 tiles only.
+    wgs: WgsInfo | None = None
     #: SQLite database of the worlds, relative to the dataset directory.
     worlds_db_path: str | None = None
     worlds_db_schema_version: int = 0
@@ -256,10 +375,15 @@ class Manifest:
     def tile_path(self, root: Path, tile: TileIndex) -> Path:
         return Path(root) / self.tile_relative_path(tile)
 
-    def rgb_tile_path(self, root: Path, tile: TileIndex) -> Path:
-        if self.rgb is None:
+    def wgs_height_path(self, root: Path, tile: TileIndex) -> Path:
+        if self.wgs is None:
+            raise ValidationError("the dataset has no WGS tiles")
+        return Path(root) / self.wgs.height_tile_pattern.format(ix=tile.ix, iy=tile.iy)
+
+    def wgs_rgb_path(self, root: Path, tile: TileIndex) -> Path:
+        if self.wgs is None or self.wgs.rgb is None:
             raise ValidationError("the dataset has no RGB tiles")
-        return Path(root) / self.rgb.tile_pattern.format(ix=tile.ix, iy=tile.iy)
+        return Path(root) / self.wgs.rgb.tile_pattern.format(ix=tile.ix, iy=tile.iy)
 
     # --- serialisation ---------------------------------------------------
 
@@ -348,8 +472,12 @@ class Manifest:
                 "count": int(self.test_points_count),
                 "columns": list(TEST_POINT_COLUMNS),
             }
-        if self.rgb is not None:
-            document["rgb"] = self.rgb.to_dict()
+        if self.wgs is not None:
+            document["wgs"] = self.wgs.to_dict(
+                nodata=self.nodata,
+                vertical_crs=self.vertical_crs,
+                vertical_datum=self.vertical_datum,
+            )
         if self.worlds_db_path is not None:
             document["worlds_db"] = {
                 "path": self.worlds_db_path,
@@ -384,9 +512,9 @@ class Manifest:
         worlds_db = document.get("worlds_db") or {}
         if not isinstance(worlds_db, dict):
             raise ValidationError(f"{origin}: section 'worlds_db' must be a mapping")
-        rgb = (
-            RgbInfo.from_dict(document["rgb"], origin=origin)
-            if document.get("rgb") is not None
+        wgs = (
+            WgsInfo.from_dict(document["wgs"], origin=origin)
+            if document.get("wgs") is not None
             else None
         )
 
@@ -395,11 +523,7 @@ class Manifest:
                 raise ValidationError(f"{origin}: missing required key {where}.{key}")
             return mapping[key]
 
-        tiles: list[TileIndex] = []
-        for entry in tiles_section.get("index", []) or []:
-            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-                raise ValidationError(f"{origin}: malformed tile index entry {entry!r}")
-            tiles.append(TileIndex(int(entry[0]), int(entry[1])))
+        tiles = _tile_index_list(tiles_section, origin=origin)
 
         return cls(
             format_version=int(document.get("format_version", FORMAT_VERSION)),
@@ -447,7 +571,7 @@ class Manifest:
                 str(test_points["path"]) if test_points.get("path") is not None else None
             ),
             test_points_count=int(test_points.get("count", 0) or 0),
-            rgb=rgb,
+            wgs=wgs,
             worlds_db_path=(
                 str(worlds_db["path"]) if worlds_db.get("path") is not None else None
             ),

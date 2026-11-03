@@ -19,7 +19,7 @@ namespace heightmap_sampler
 {
 
 /// Only this manifest layout is understood.
-inline constexpr int kFormatVersion = 1;
+inline constexpr int kFormatVersion = 2;
 
 inline constexpr const char * kManifestFilename = "dataset.yaml";
 

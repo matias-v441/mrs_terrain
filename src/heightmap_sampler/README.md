@@ -56,6 +56,11 @@ repository's `worlds/`, with heights on the WGS84 ellipsoid. After changing
 those worlds, run `./regenerate.sh` from the repository root and commit
 `dataset/`.
 
+The sampler reads only the EPSG:5514 tiles under `height/`. The dataset also
+carries EPSG:4326 WGS tiles of heights and orthophoto imagery under `wgs/`, and
+a worlds database; they are installed with it but not read by this package.
+`dataset.yaml` must be of format version 2.
+
 To bundle a different dataset instead, point the build at it:
 
 ```bash

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from heightmap_prep.config import WorldConfig, WorldOrigin, load_world
-from heightmap_prep.manifest import Manifest
+from heightmap_prep.manifest import Manifest, WgsInfo
 from heightmap_prep.tiling import TileIndex
 from heightmap_prep.validate import ValidationReport, validate_worlds_db
 from heightmap_prep.worlds_db import (
@@ -100,11 +100,15 @@ def test_the_wkt_polygon_is_closed_and_lon_lat() -> None:
 # --- the database --------------------------------------------------------
 
 
+WGS_TILES = [TileIndex(10567, 2170), TileIndex(10568, 2170)]
+
+
 def manifest_with(tiles, worlds) -> Manifest:
     manifest = Manifest(horizontal_crs="EPSG:5514", vertical_crs="EPSG:5773",
                         vertical_datum="egm96", nodata=-9999.0)
     manifest.set_tiles(tiles)
     manifest.worlds = list(worlds)
+    manifest.wgs = WgsInfo(resolution_m=0.25, resolution_deg=0.25 / 111_320.0, tiles=WGS_TILES)
     return manifest
 
 
@@ -117,7 +121,11 @@ def build(tmp_path: Path) -> tuple[Path, Manifest]:
     tiles = [TileIndex(1, 2), TileIndex(2, 2)]
     manifest = manifest_with(tiles, ["a", "b"])
     path = write_worlds_db(
-        tmp_path, manifest, worlds, {"a": [TileIndex(1, 2)], "b": tiles},
+        tmp_path,
+        manifest,
+        worlds,
+        {"a": [TileIndex(1, 2)], "b": tiles},
+        {"a": WGS_TILES[:1], "b": WGS_TILES},
     )
     return path, manifest
 
@@ -142,10 +150,25 @@ def test_the_database_records_every_world(tmp_path: Path) -> None:
         "SELECT lat, lon FROM safety_area_vertices WHERE world = 'b' ORDER BY seq"
     ).fetchall()
     assert vertices == [(lat, lon) for lon, lat in SQUARE]
-    assert db.execute("SELECT ix, iy FROM world_tiles WHERE world = 'a'").fetchall() == [(1, 2)]
     assert db.execute(
-        "SELECT height_path, rgb_path FROM tiles ORDER BY ix"
-    ).fetchall() == [("height/tile_1_2.tif", None), ("height/tile_2_2.tif", None)]
+        "SELECT ix, iy FROM world_height_tiles WHERE world = 'a'"
+    ).fetchall() == [(1, 2)]
+    assert db.execute(
+        "SELECT path FROM height_tiles ORDER BY ix"
+    ).fetchall() == [("height/tile_1_2.tif",), ("height/tile_2_2.tif",)]
+    assert db.execute(
+        "SELECT ix, iy FROM world_wgs_tiles WHERE world = 'b' ORDER BY ix"
+    ).fetchall() == [(10567, 2170), (10568, 2170)]
+    rows = db.execute(
+        "SELECT ix, west, south, east, north, height_path, rgb_path FROM wgs_tiles ORDER BY ix"
+    ).fetchall()
+    grid = manifest.wgs.grid()
+    assert [row[0] for row in rows] == [10567, 10568]
+    assert rows[0][1:5] == grid.tile_bounds(WGS_TILES[0])
+    assert rows[0][1] < rows[0][3] and rows[0][2] < rows[0][4]
+    assert rows[0][5:] == ("wgs/height/tile_10567_2170.tif", None)
+    # Disjoint neighbours: one tile's east edge is the next one's west edge.
+    assert rows[0][3] == rows[1][1]
     db.close()
     assert validate_worlds_db(tmp_path, manifest).ok
 

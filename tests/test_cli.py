@@ -176,5 +176,6 @@ def test_include_rgb_prepares_rgb_tiles(
     )
     assert code == 0
     assert seen["options"].include_rgb and seen["options"].rgb_jpeg_quality == 80
-    assert list((out / "rgb").glob("tile_*.tif"))
+    assert list((out / "wgs" / "rgb").glob("tile_*.tif"))
+    assert list((out / "wgs" / "height").glob("tile_*.tif"))
     assert (out / "worlds.sqlite").is_file()

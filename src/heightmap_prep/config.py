@@ -80,6 +80,13 @@ class WorldConfig:
     min_z: float | None = None
     max_z: float | None = None
 
+    @property
+    def bounds(self) -> tuple[float, float, float, float]:
+        """``(west, south, east, north)`` of the safety area, in degrees."""
+        lons = [lon for lon, _ in self.points]
+        lats = [lat for _, lat in self.points]
+        return min(lons), min(lats), max(lons), max(lats)
+
     def describe(self) -> str:
         """A short identifier used in log lines and error messages."""
         if self.path is None:
@@ -96,6 +103,10 @@ class PrepareOptions:
     #: North-south ground size of an RGB pixel, in metres.
     rgb_resolution_m: float = 0.25
     rgb_jpeg_quality: int = 90
+    #: A WGS tile's width and height, in RGB lattice pixels.
+    wgs_tile_size_px: int = 8192
+    #: RGB lattice pixels per WGS height pixel, along each axis.
+    wgs_height_factor: int = 8
     resolution_m: float = 2.0
     tile_size_px: int = 4096
     proj_data_dir: Path | None = None
@@ -139,6 +150,15 @@ class PrepareOptions:
         if not 1 <= self.rgb_jpeg_quality <= 100:
             raise ConfigError(
                 f"rgb_jpeg_quality must be between 1 and 100, got {self.rgb_jpeg_quality}"
+            )
+        if self.wgs_height_factor < 1:
+            raise ConfigError(
+                f"wgs_height_factor must be positive, got {self.wgs_height_factor}"
+            )
+        if self.wgs_tile_size_px < 1 or self.wgs_tile_size_px % self.wgs_height_factor:
+            raise ConfigError(
+                f"wgs_tile_size_px must be a positive multiple of wgs_height_factor "
+                f"({self.wgs_height_factor}), got {self.wgs_tile_size_px}"
             )
         if self.tile_size_px <= 0:
             raise ConfigError(f"tile_size_px must be positive, got {self.tile_size_px}")

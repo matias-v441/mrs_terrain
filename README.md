@@ -32,8 +32,9 @@ Heights are WGS84 ellipsoidal metres, the datum `regenerate.sh` prepares. A
 point outside the worlds' safety areas may have no height. There is also a ROS
 service node; see [the package README](src/heightmap_sampler/README.md).
 
-The dataset also holds orthophoto imagery of every world and a database of the
-worlds (safety area, origin, tiles). From Python:
+The dataset also holds every world's heights and orthophoto imagery as
+[WGS tiles](#wgs-tiles) in EPSG:4326, and a database of the worlds (safety area,
+origin, tiles). From Python:
 
 ```python
 from heightmap_prep.world_dataset import WorldDataset
@@ -41,10 +42,11 @@ from heightmap_prep.world_dataset import WorldDataset
 with WorldDataset("dataset") as dataset:
     dataset.world_names()                      # ['bechovice', 'brandysek', ...]
     world = dataset.world("temesvar_field")    # safety area, origin, min/max z, tiles
-    image = dataset.read_rgb("temesvar_field", margin_m=10)   # RGB + mask, EPSG:4326
+    heights = dataset.read_height("temesvar_field")   # float32, EPSG:4326
+    image = dataset.read_rgb("temesvar_field")        # RGB + mask, same area
 ```
 
-or `heightmap-worlds dataset temesvar_field --export field.tif`.
+or `heightmap-worlds dataset temesvar_field --export field.tif --export-height field_h.tif`.
 See [Reading worlds back](#reading-worlds-back).
 
 ### Adding or changing a world
@@ -185,16 +187,18 @@ source has no height. Any tiles only a skipped world needed are left out of the
 dataset. The run fails only when no world is left, or on problems that affect
 every world, such as the source service failing or PROJ grids missing.
 
-The dataset holds exactly the tiles a bilinear sampler reads when queried
-anywhere inside a safety area, border included, and no others:
+Each world is prepared over the lat/lon bounding box of its safety area,
+snapped outward to the [WGS height lattice](#wgs-tiles): the area its WGS tiles
+hold. The EPSG:5514 tiles hold exactly what a bilinear sampler reads when
+queried anywhere in that box, border included, and no others:
 
 * a query interpolates between the four pixel centres around it, so the pixels
-  prepared are those around the safety area, with no further margin;
-* a tile is included only if the polygon itself comes within half a pixel of
-  it, so a diagonal safety area does not pull in tiles that merely share its
-  bounding box;
-* a safety area on or within half a pixel of a tile edge interpolates across
-  it, so the adjacent tile is included too.
+  prepared are those around the box, with no further margin;
+* the box is a curved quadrilateral in EPSG:5514, rotated about 8° against the
+  grid, so its edges are densified before projecting, and a tile is included
+  only if the box itself comes within half a pixel of it;
+* a box on or within half a pixel of a tile edge interpolates across it, so the
+  adjacent tile is included too.
 
 Within a tile only those pixels are fetched; the rest of the tile is NoData.
 
@@ -230,10 +234,13 @@ OUTPUT_DIR/
     dataset.yaml
     test_points.csv
     worlds.sqlite
-    height/
+    height/                   # EPSG:5514, what samplers read
         tile_<ix>_<iy>.tif
-    rgb/                      # with --include-rgb
-        tile_<ix>_<iy>.tif
+    wgs/                      # EPSG:4326, indexed independently
+        height/
+            tile_<ix>_<iy>.tif
+        rgb/                  # with --include-rgb
+            tile_<ix>_<iy>.tif
 ```
 
 Height tiles are single-band `float32`, `deflate`-compressed with `predictor=3`,
@@ -313,30 +320,40 @@ Tiles carry no halo, so a sampler doing bilinear interpolation near a tile edge
 must load the neighbouring tile. `examples/sampler.py` is a ~100-line reference
 implementation of the whole runtime path.
 
-### RGB imagery
+### WGS tiles
 
-With `--include-rgb`, every height tile `(ix, iy)` gets an RGB tile with the
-same index in `rgb/`, holding the [ČÚZK orthophoto](https://ags.cuzk.gov.cz/arcgis1/rest/services/ORTOFOTO/MapServer)
-in the query CRS, EPSG:4326. The service renders the imagery in EPSG:4326 itself,
-S-JTSK → WGS84 datum shift included; checked against a local PROJ warp of its
-EPSG:5514 output, the two agree to within a pixel.
+Besides the EPSG:5514 tiles samplers read, the dataset holds every world's
+heights and, with `--include-rgb`, the [ČÚZK orthophoto](https://ags.cuzk.gov.cz/arcgis1/rest/services/ORTOFOTO/MapServer)
+in the query CRS, EPSG:4326, for retrieving image regions. They have their own
+tiling, independent of the EPSG:5514 grid:
 
-* **Lattice.** All RGB tiles are windows of one global lattice of square-degree
-  pixels anchored at (-180°, 90°), so overlapping tiles hold identical pixels.
-  `--rgb-resolution` is the north-south pixel size; at Czech latitudes pixels
-  are about 0.65 of that east-west. Square-degree pixels are what the ArcGIS
-  `export` operation renders.
-* **Extent.** RGB tile `(ix, iy)` covers the EPSG:4326 bounding box of height
-  tile `(ix, iy)` grown by half a height pixel, snapped outward to the lattice.
-  To find the imagery at a lon/lat, find the height tile as usual, open the RGB
-  tile with the same index and use its own geotransform. Krovak East North is
-  rotated against the meridians, so neighbouring RGB tiles overlap slightly.
-* **Content.** Like height tiles, only the area the worlds need is fetched: the
-  bounding box of each world's height pixels in that tile. The rest of the tile
-  is masked out and, since the files are sparse, takes no space.
-* **Storage.** Three-band `uint8` GeoTIFF, JPEG (YCbCr) at `--rgb-jpeg-quality`,
-  512×512 blocks, with an internal mask marking where there is imagery. The
-  `rgb:` section of `dataset.yaml` records all of it.
+* **Lattices.** One global lattice of square-degree pixels anchored at
+  (-180°, 90°). An RGB pixel is `--rgb-resolution` metres north-south (0.25 m by
+  default); at Czech latitudes that is about 0.65 of it east-west. A height
+  pixel is 8 × 8 RGB pixels. Square-degree pixels are what the ArcGIS `export`
+  operation renders.
+* **Tiles.** WGS tile `(ix, iy)` is 8192 × 8192 RGB pixels (1024 × 1024 height
+  pixels, 0.0184° or about 2.0 × 1.3 km at 0.25 m), with
+  `ix = floor((lon + 180) / tile_span_deg)` and
+  `iy = floor((90 - lat) / tile_span_deg)`. Tiles never overlap, and the height
+  and RGB tiles of one index cover exactly the same area.
+* **Content.** A world's WGS tiles hold data over its safety area's lat/lon
+  bounding box, snapped outward to the height lattice, with no further margin;
+  where worlds share a tile, the window holding both. The rest of the tile is
+  NoData or masked out and, since the files are sparse, takes no space.
+* **Heights.** Each pixel is the bilinear sample of the EPSG:5514 tiles at the
+  pixel centre, exactly as the sampling contract defines, in the same vertical
+  datum. Single-band `float32`, `deflate` with `predictor=3`, 256×256 blocks,
+  NoData as for the EPSG:5514 tiles. They are derived from the EPSG:5514 tiles
+  and rebuilt on every run.
+* **Imagery.** The service renders the imagery in EPSG:4326 itself, S-JTSK →
+  WGS84 datum shift included; checked against a local PROJ warp of its
+  EPSG:5514 output, the two agree to within a pixel. Three-band `uint8`
+  GeoTIFF, JPEG (YCbCr) at `--rgb-jpeg-quality`, 512×512 blocks, with an
+  internal mask marking where there is imagery.
+
+The `wgs:` section of `dataset.yaml` records the lattice, the tile list and
+both layers' storage.
 
 ### Worlds database
 
@@ -347,9 +364,13 @@ consumer does not need the world files. Coordinates are WGS84 degrees.
 | --- | --- |
 | `worlds` | `name`, `source_file`, the world origin as given (`origin_units`, `origin_x`, `origin_y`) and in degrees (`origin_lat`, `origin_lon`), `safety_area_frame`, `vertical_frame`, `min_z`, `max_z`, `safety_area_wkt` |
 | `safety_area_vertices` | `world`, `seq`, `lat`, `lon`, in world-file order |
-| `tiles` | `ix`, `iy`, `height_path`, `rgb_path`, `rgb_west`/`south`/`east`/`north` |
-| `world_tiles` | `world`, `ix`, `iy`: the tiles each world needs |
-| `meta` | schema version, query CRS, tile patterns |
+| `height_tiles` | `ix`, `iy`, `path`: the EPSG:5514 tiles |
+| `world_height_tiles` | `world`, `ix`, `iy`: the EPSG:5514 tiles each world needs |
+| `wgs_tiles` | `ix`, `iy`, `west`/`south`/`east`/`north`, `height_path`, `rgb_path` (NULL without RGB) |
+| `world_wgs_tiles` | `world`, `ix`, `iy`: the WGS tiles holding each world |
+| `meta` | schema version, query CRS, tile patterns, WGS tile span |
+
+The two kinds of tile are indexed independently.
 
 A UTM world origin has no zone, so it is placed in the UTM zone of the safety
 area. `PRAGMA user_version` is the schema version, which `dataset.yaml` repeats
@@ -370,22 +391,25 @@ with WorldDataset("prepared") as dataset:
         world.safety_area          # ((lat, lon), ...)
         world.origin               # Origin(units, x, y, lat, lon) or None
         world.min_z, world.max_z   # vertical safety limits, in world.vertical_frame
-        world.tiles                # (TileIndex, ...)
-    dataset.rgb_tiles("bechovice")             # [RgbTile(tile, path, bounds), ...]
-    image = dataset.read_rgb("bechovice", margin_m=5)
-    image.data, image.mask, image.transform    # (3, h, w) uint8, (h, w) bool, EPSG:4326
+        world.height_tiles         # EPSG:5514 (TileIndex, ...)
+        world.wgs_tiles            # WGS (TileIndex, ...)
+    dataset.wgs_tiles("bechovice")             # [WgsTile(tile, bounds, height_path, rgb_path), ...]
+    heights = dataset.read_height("bechovice")
+    heights.data, heights.transform            # (h, w) float32 with NaN, EPSG:4326
+    image = dataset.read_rgb("bechovice")
+    image.data, image.mask, image.transform    # (3, 8h, 8w) uint8, (8h, 8w) bool, EPSG:4326
     image.write("bechovice.tif")
 ```
 
-`read_rgb` mosaics the world's RGB tiles and crops them to the bounding box of
-its safety area, grown by `margin_m`. The tiles only hold imagery a few metres
-beyond the safety area (further where other worlds are near), so a wide margin
-comes back partly masked. The same is available from the shell:
+`read_height` and `read_rgb` mosaic the world's WGS tiles over exactly the area
+they hold for it: the safety area's lat/lon bounding box snapped outward to the
+height lattice. The two images therefore cover the same area. The same is
+available from the shell:
 
 ```bash
 heightmap-worlds prepared                     # list the worlds
 heightmap-worlds prepared bechovice           # describe one
-heightmap-worlds prepared bechovice --export bechovice.tif --margin 5
+heightmap-worlds prepared bechovice --export bechovice.tif --export-height bechovice_h.tif
 ```
 
 ## Sampling from C++
@@ -411,10 +435,12 @@ validated, and only then renamed into place, so an interrupted run never leaves
 a truncated file that a later run would trust. Tiles carry their provenance as
 GDAL metadata (source id, vertical datum, resolution, processing version) and
 are reused on a later run only when all of it matches and the file still
-validates. A mismatch is an error unless `--overwrite` is given. RGB tiles also
-record which part of them holds imagery, and are reused only when that covers
-what the worlds now need, so adding a world to an existing RGB tile needs
-`--overwrite`.
+validates. A mismatch is an error unless `--overwrite` is given. Height and RGB
+tiles also record which part of them holds data, and are reused only when that
+covers what the worlds now need, so adding a world to an existing tile needs
+`--overwrite`. The EPSG:5514 pixels a world needs depend on the WGS height
+lattice, so changing `--rgb-resolution` needs `--overwrite` too. WGS height
+tiles are derived from the EPSG:5514 tiles and rebuilt on every run.
 
 The manifest is `status: building` during generation and `status: complete`
 afterwards. A run that fails before writing anything restores the previous
@@ -438,9 +464,14 @@ Nothing is published before it has been checked:
 * **plausibility** — elevations outside the Czech range, all-zero tiles, tiles
   with no data at all and a suspiciously unchanged conversion produce
   *warnings* only, and never replace the CRS-level checks;
-* **each RGB tile** — EPSG:4326, three `uint8` bands with an internal mask, on
-  the lattice, covering its height tile, with imagery where it was fetched (a
-  warning if under 99 % of it);
+* **each WGS height tile** — EPSG:4326, exactly its tile's window on the height
+  lattice, one `float32` band with the dataset's NoData, and a sample of its
+  pixels equal to the EPSG:5514 sampler's height at their centres;
+* **each RGB tile** — EPSG:4326, exactly its tile's window on the RGB lattice,
+  three `uint8` bands with an internal mask, with imagery where it was fetched
+  (a warning if under 99 % of it);
+* **WGS coverage** — a warning for any world whose lat/lon box has heights over
+  less than 99 % of it;
 * **worlds database** — schema version, the same worlds and tiles as the
   manifest, at least three safety area vertices per world.
 
@@ -450,6 +481,7 @@ Nothing is published before it has been checked:
 | --- | --- | --- |
 | Query | EPSG:4326 | WGS84 lon/lat |
 | Stored horizontal | EPSG:5514 | S-JTSK / Krovak East North, metres |
+| WGS tiles horizontal | EPSG:4326 | WGS84 lon/lat, square-degree pixels |
 | Source vertical | EPSG:8357 | Bpv / Baltic 1957 height |
 | Stored vertical (`egm96`) | EPSG:5773 | EGM96 gravity-related height |
 | Stored vertical (`wgs84-ellipsoid`) | EPSG:4979 | WGS84 ellipsoidal height |

@@ -1,4 +1,4 @@
-"""Read the worlds of a prepared dataset: safety areas, origins and RGB imagery.
+"""Read the worlds of a prepared dataset: safety areas, origins, heights and imagery.
 
 A consumer-side view of a dataset directory, built on ``dataset.yaml`` and
 ``worlds.sqlite``.  It needs neither the network nor PROJ grids::
@@ -9,15 +9,21 @@ A consumer-side view of a dataset directory, built on ``dataset.yaml`` and
         print(dataset.world_names())
         world = dataset.world("temesvar_field")
         print(world.safety_area, world.origin)
-        for tile in dataset.rgb_tiles("temesvar_field"):
-            print(tile.path, tile.bounds)
-        image = dataset.read_rgb("temesvar_field", margin_m=20.0)
+        for tile in dataset.wgs_tiles("temesvar_field"):
+            print(tile.tile, tile.bounds, tile.height_path, tile.rgb_path)
+        heights = dataset.read_height("temesvar_field")
+        image = dataset.read_rgb("temesvar_field")
 
 or from the shell::
 
     heightmap-worlds DATASET                         # list the worlds
     heightmap-worlds DATASET WORLD                   # describe one
-    heightmap-worlds DATASET WORLD --export world.tif --margin 10
+    heightmap-worlds DATASET WORLD --export world.tif --export-height heights.tif
+
+Heights and imagery come from the WGS tiles, cropped to the world's lat/lon
+bounding box snapped outward to the WGS height lattice, which is exactly where
+those tiles hold data for it.  The height and RGB images of a world therefore
+cover the same area, with ``height_factor`` RGB pixels per height pixel.
 """
 
 from __future__ import annotations
@@ -34,9 +40,9 @@ import rasterio
 import rasterio.windows
 from affine import Affine
 
-from .manifest import Manifest
-from .rgb import RgbGrid, metres_to_degrees
+from .manifest import Manifest, WgsInfo
 from .tiling import TileIndex
+from .wgs import Lattice, LatticeWindow
 from .worlds_db import SCHEMA_VERSION, WORLDS_DB_FILENAME
 
 
@@ -66,8 +72,10 @@ class World:
     vertical_frame: str | None
     min_z: float | None
     max_z: float | None
-    #: Tiles the world needs; height and RGB tiles share these indices.
-    tiles: tuple[TileIndex, ...]
+    #: EPSG:5514 height tiles a sampler reads for this world.
+    height_tiles: tuple[TileIndex, ...]
+    #: WGS tiles holding this world's heights and imagery.
+    wgs_tiles: tuple[TileIndex, ...]
     source_file: str | None
 
     @property
@@ -79,29 +87,43 @@ class World:
 
 
 @dataclass(frozen=True)
-class RgbTile:
+class WgsTile:
     tile: TileIndex
-    path: Path
     #: ``(west, south, east, north)`` in degrees.
     bounds: tuple[float, float, float, float]
+    height_path: Path
+    #: ``None`` when the dataset has no RGB imagery.
+    rgb_path: Path | None
 
 
 @dataclass
-class RgbImage:
+class _Image:
+    transform: Affine
+    crs: str
+
+    @property
+    def _shape(self) -> tuple[int, int]:
+        raise NotImplementedError
+
+    @property
+    def bounds(self) -> tuple[float, float, float, float]:
+        height, width = self._shape
+        west, north = self.transform.c, self.transform.f
+        return west, north + height * self.transform.e, west + width * self.transform.a, north
+
+
+@dataclass
+class RgbImage(_Image):
     """A piece of the RGB lattice, in EPSG:4326."""
 
     #: ``(3, height, width)`` uint8 red, green and blue.
     data: np.ndarray
     #: ``(height, width)``; True where there is imagery.
     mask: np.ndarray
-    transform: Affine
-    crs: str
 
     @property
-    def bounds(self) -> tuple[float, float, float, float]:
-        height, width = self.mask.shape
-        west, north = self.transform.c, self.transform.f
-        return west, north + height * self.transform.e, west + width * self.transform.a, north
+    def _shape(self) -> tuple[int, int]:
+        return self.mask.shape
 
     def write(self, path: Path) -> Path:
         """Save as an RGB GeoTIFF with an internal mask."""
@@ -121,6 +143,38 @@ class RgbImage:
             with rasterio.open(path, "w", **profile) as dataset:
                 dataset.write(self.data)
                 dataset.write_mask(np.where(self.mask, 255, 0).astype(np.uint8))
+        return Path(path)
+
+
+@dataclass
+class HeightImage(_Image):
+    """A piece of the WGS height lattice, in EPSG:4326."""
+
+    #: ``(height, width)`` float32 heights; NaN where there are none.
+    data: np.ndarray
+    vertical_crs: str
+
+    @property
+    def _shape(self) -> tuple[int, int]:
+        return self.data.shape
+
+    def write(self, path: Path) -> Path:
+        """Save as a float32 GeoTIFF with NaN as NoData."""
+        profile = {
+            "driver": "GTiff",
+            "dtype": "float32",
+            "count": 1,
+            "width": self.data.shape[1],
+            "height": self.data.shape[0],
+            "transform": self.transform,
+            "crs": self.crs,
+            "nodata": float("nan"),
+            "tiled": True,
+            "compress": "deflate",
+            "predictor": 3,
+        }
+        with rasterio.open(path, "w", **profile) as dataset:
+            dataset.write(self.data.astype(np.float32), 1)
         return Path(path)
 
 
@@ -177,9 +231,6 @@ class WorldDataset:
         vertices = self._db.execute(
             "SELECT lat, lon FROM safety_area_vertices WHERE world = ? ORDER BY seq", (name,)
         ).fetchall()
-        tiles = self._db.execute(
-            "SELECT ix, iy FROM world_tiles WHERE world = ? ORDER BY iy, ix", (name,)
-        ).fetchall()
         return World(
             name=name,
             safety_area=tuple((float(a), float(b)) for a, b in vertices),
@@ -187,77 +238,110 @@ class WorldDataset:
             vertical_frame=vertical_frame,
             min_z=min_z,
             max_z=max_z,
-            tiles=tuple(TileIndex(ix, iy) for ix, iy in tiles),
+            height_tiles=self._tiles("world_height_tiles", name),
+            wgs_tiles=self._tiles("world_wgs_tiles", name),
             source_file=source_file,
         )
+
+    def _tiles(self, table: str, name: str) -> tuple[TileIndex, ...]:
+        rows = self._db.execute(
+            f"SELECT ix, iy FROM {table} WHERE world = ? ORDER BY iy, ix", (name,)
+        ).fetchall()
+        return tuple(TileIndex(ix, iy) for ix, iy in rows)
 
     def safety_area(self, name: str) -> tuple[tuple[float, float], ...]:
         """The safety area as ``(lat, lon)`` vertices."""
         return self.world(name).safety_area
 
-    # --- imagery -----------------------------------------------------------
+    # --- WGS tiles -----------------------------------------------------------
+
+    @property
+    def wgs(self) -> WgsInfo:
+        if self.manifest.wgs is None:
+            raise ValueError(f"{self.root} has no WGS tiles")
+        return self.manifest.wgs
 
     @property
     def has_rgb(self) -> bool:
-        return self.manifest.rgb is not None
+        return self.manifest.wgs is not None and self.manifest.wgs.rgb is not None
 
-    def rgb_tiles(self, name: str) -> list[RgbTile]:
-        """The RGB tiles holding the imagery of world ``name``."""
-        if not self.has_rgb:
-            raise ValueError(f"{self.root} was prepared without RGB imagery (--include-rgb)")
+    def wgs_tiles(self, name: str) -> list[WgsTile]:
+        """The WGS tiles holding the heights and imagery of world ``name``."""
         rows = self._db.execute(
-            "SELECT t.ix, t.iy, t.rgb_path, t.rgb_west, t.rgb_south, t.rgb_east, t.rgb_north "
-            "FROM world_tiles w JOIN tiles t ON t.ix = w.ix AND t.iy = w.iy "
+            "SELECT t.ix, t.iy, t.west, t.south, t.east, t.north, t.height_path, t.rgb_path "
+            "FROM world_wgs_tiles w JOIN wgs_tiles t ON t.ix = w.ix AND t.iy = w.iy "
             "WHERE w.world = ? ORDER BY t.iy, t.ix",
             (self.world(name).name,),
         ).fetchall()
         return [
-            RgbTile(TileIndex(ix, iy), self.root / path, (west, south, east, north))
-            for ix, iy, path, west, south, east, north in rows
+            WgsTile(
+                TileIndex(ix, iy),
+                (west, south, east, north),
+                self.root / height_path,
+                self.root / rgb_path if rgb_path is not None else None,
+            )
+            for ix, iy, west, south, east, north, height_path, rgb_path in rows
         ]
 
-    def read_rgb(self, name: str, margin_m: float = 0.0) -> RgbImage:
-        """World ``name``'s imagery, cropped to its safety area's bounding box.
+    def fill_window(self, name: str) -> LatticeWindow:
+        """Where the WGS tiles hold data for world ``name``, on the height lattice."""
+        return self.wgs.grid().fill_for_lonlat(self.world(name).bounds)
 
-        ``margin_m`` grows the box on every side; the tiles only hold imagery a
-        few metres beyond the safety area, so a wide margin comes back masked.
-        Where RGB tiles overlap they hold identical pixels, so the first one
-        with imagery wins.
-        """
-        world = self.world(name)
-        tiles = self.rgb_tiles(name)
-        assert self.manifest.rgb is not None
-        grid: RgbGrid = self.manifest.rgb.grid()
-
-        west, south, east, north = world.bounds
-        pad_lon, pad_lat = metres_to_degrees(margin_m, (south + north) / 2)
-        target = grid.window_for_lonlat(
-            (west - pad_lon, south - pad_lat, east + pad_lon, north + pad_lat)
+    def read_height(self, name: str) -> HeightImage:
+        """World ``name``'s heights on the WGS height lattice."""
+        lattice = self.wgs.grid().height
+        target = self.fill_window(name)
+        data = np.full((1, target.height, target.width), np.nan, dtype=np.float32)
+        valid = np.zeros((target.height, target.width), dtype=bool)
+        self._mosaic(lattice, target, [t.height_path for t in self.wgs_tiles(name)], data, valid)
+        return HeightImage(
+            transform=lattice.window_transform(target),
+            crs=self.wgs.crs,
+            data=data[0],
+            vertical_crs=self.manifest.vertical_crs,
         )
+
+    def read_rgb(self, name: str) -> RgbImage:
+        """World ``name``'s imagery on the RGB lattice, covering what :meth:`read_height` does."""
+        if not self.has_rgb:
+            raise ValueError(f"{self.root} was prepared without RGB imagery (--include-rgb)")
+        grid = self.wgs.grid()
+        target = self.fill_window(name).scaled(grid.height_factor)
+        paths = [t.rgb_path for t in self.wgs_tiles(name) if t.rgb_path is not None]
         data = np.zeros((3, target.height, target.width), dtype=np.uint8)
         mask = np.zeros((target.height, target.width), dtype=bool)
+        self._mosaic(grid.rgb, target, paths, data, mask)
+        return RgbImage(
+            transform=grid.rgb.window_transform(target), crs=self.wgs.crs, data=data, mask=mask
+        )
 
-        for tile in tiles:
-            with rasterio.open(tile.path) as dataset:
-                window = grid.window_of_transform(dataset.transform, dataset.width, dataset.height)
+    @staticmethod
+    def _mosaic(
+        lattice: Lattice,
+        target: LatticeWindow,
+        paths: Sequence[Path],
+        data: np.ndarray,
+        valid: np.ndarray,
+    ) -> None:
+        """Paste the part of each tile inside ``target``; tiles never overlap."""
+        for path in paths:
+            with rasterio.open(path) as dataset:
+                window = lattice.window_of_transform(
+                    dataset.transform, dataset.width, dataset.height
+                )
                 if window is None:
-                    raise ValueError(f"{tile.path} is not on the dataset's RGB lattice")
+                    raise ValueError(f"{path} is not on the dataset's WGS lattice")
                 overlap = window.intersection(target)
                 if overlap is None:
                     continue
                 col, row = overlap.offset_in(window)
                 read = rasterio.windows.Window(col, row, overlap.width, overlap.height)
                 pixels = dataset.read(window=read)
-                valid = dataset.read_masks(1, window=read) > 0
+                good = dataset.read_masks(1, window=read) > 0
             col, row = overlap.offset_in(target)
             region = (slice(row, row + overlap.height), slice(col, col + overlap.width))
-            fresh = valid & ~mask[region]
-            data[(slice(None), *region)][:, fresh] = pixels[:, fresh]
-            mask[region] |= fresh
-
-        return RgbImage(
-            data=data, mask=mask, transform=grid.window_transform(target), crs=self.manifest.rgb.crs
-        )
+            data[(slice(None), *region)] = np.where(good, pixels, data[(slice(None), *region)])
+            valid[region] = good
 
 
 # --- command line ------------------------------------------------------------
@@ -279,17 +363,21 @@ def _describe(world: World, dataset: WorldDataset) -> str:
         lines.append(f"  height: {world.min_z} .. {world.max_z} m in {world.vertical_frame}")
     lines.append(f"  safety area ({len(world.safety_area)} vertices, lat, lon):")
     lines.extend(f"    {lat:.7f}, {lon:.7f}" for lat, lon in world.safety_area)
-    lines.append("  tiles: " + ", ".join(f"({t.ix}, {t.iy})" for t in world.tiles))
-    if dataset.has_rgb:
-        for tile in dataset.rgb_tiles(world.name):
-            lines.append(f"  rgb: {tile.path.relative_to(dataset.root)}")
+    lines.append(
+        "  EPSG:5514 tiles: " + ", ".join(f"({t.ix}, {t.iy})" for t in world.height_tiles)
+    )
+    for tile in dataset.wgs_tiles(world.name):
+        lines.append(f"  wgs tile ({tile.tile.ix}, {tile.tile.iy}):")
+        lines.append(f"    height: {tile.height_path.relative_to(dataset.root)}")
+        if tile.rgb_path is not None:
+            lines.append(f"    rgb: {tile.rgb_path.relative_to(dataset.root)}")
     return "\n".join(lines)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="heightmap-worlds",
-        description="List the worlds of a prepared dataset, describe one, or export its imagery.",
+        description="List the worlds of a prepared dataset, describe one, or export it.",
     )
     parser.add_argument("dataset", type=Path, help="prepared dataset directory")
     parser.add_argument("world", nargs="?", help="world to describe")
@@ -297,12 +385,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--export", type=Path, metavar="PATH", help="write the world's imagery as a GeoTIFF"
     )
     parser.add_argument(
-        "--margin", type=float, default=0.0, metavar="METRES",
-        help="grow the exported area beyond the safety area (default: 0)",
+        "--export-height", type=Path, metavar="PATH",
+        help="write the world's WGS heights as a GeoTIFF",
     )
     args = parser.parse_args(argv)
-    if args.export and not args.world:
-        parser.error("--export needs a WORLD")
+    if (args.export or args.export_height) and not args.world:
+        parser.error("--export and --export-height need a WORLD")
 
     try:
         with WorldDataset(args.dataset) as dataset:
@@ -312,9 +400,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             world = dataset.world(args.world)
             print(_describe(world, dataset))
             if args.export:
-                image = dataset.read_rgb(world.name, margin_m=args.margin)
+                image = dataset.read_rgb(world.name)
                 image.write(args.export)
                 print(f"wrote {image.data.shape[2]}x{image.data.shape[1]} px to {args.export}")
+            if args.export_height:
+                heights = dataset.read_height(world.name)
+                heights.write(args.export_height)
+                print(
+                    f"wrote {heights.data.shape[1]}x{heights.data.shape[0]} px to "
+                    f"{args.export_height}"
+                )
     except (OSError, ValueError, KeyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

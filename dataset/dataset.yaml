@@ -1,4 +1,4 @@
-format_version: 1
+format_version: 2
 status: complete
 heightmap:
   horizontal_crs: EPSG:5514
@@ -87,8 +87,8 @@ software:
   pyproj_version: 3.8.0
   proj_version: 9.8.1
 processing:
-  created_utc: '2026-10-03T17:52:53Z'
-  updated_utc: '2026-10-03T17:53:01Z'
+  created_utc: '2026-11-02T01:42:54Z'
+  updated_utc: '2026-11-02T01:43:04Z'
   interpolation: nearest
   vertical_conversion: proj
   processing_version: '1'
@@ -99,37 +99,76 @@ test_points:
   - lat
   - lon
   - height
-rgb:
+wgs:
   crs: EPSG:4326
-  bands:
-  - red
-  - green
-  - blue
-  dtype: uint8
-  mask: internal
-  resolution_m: 0.25
-  resolution_deg: 2.2457779374775424e-06
   lattice_origin_lon: -180.0
   lattice_origin_lat: 90.0
-  tile_pattern: rgb/tile_{ix}_{iy}.tif
-  tile_extent: rgb tile (ix, iy) covers the EPSG:4326 bounding box of height tile
-    (ix, iy) grown by half a height pixel, snapped outward to the lattice; find it
-    as for the height tile, then locate pixels with its own geotransform. Only pixels
-    around the safety areas hold imagery; the internal mask marks them.
-  storage:
-    format: geotiff
-    compression: jpeg
-    photometric: ycbcr
-    jpeg_quality: 90
-    block_width_px: 512
-    block_height_px: 512
-  source:
-    provider: CUZK
-    product: ORTOFOTO
-    source_id: cuzk-ortofoto
-    reprojection: server
-    service_url: https://ags.cuzk.gov.cz/arcgis1/rest/services/ORTOFOTO/MapServer
-  processing_version: '1'
+  resolution_m: 0.25
+  resolution_deg: 2.2457779374775424e-06
+  tile_size_px: 8192
+  tile_span_deg: 0.018397412863816028
+  index_convention: origin is the west/north edge of lattice pixel (0, 0); ix increases
+    eastward, iy increases southward; ix = floor((lon - lattice_origin_lon) / tile_span_deg),
+    iy = floor((lattice_origin_lat - lat) / tile_span_deg); tiles do not overlap,
+    and the height and rgb tiles of one index cover the same area
+  height:
+    resolution_deg: 1.796622349982034e-05
+    height_factor: 8
+    tile_width_px: 1024
+    tile_height_px: 1024
+    tile_pattern: wgs/height/tile_{ix}_{iy}.tif
+    dtype: float32
+    unit: m
+    nodata: -9999.0
+    vertical_crs: EPSG:4979
+    vertical_datum: wgs84-ellipsoid
+    derivation: bilinear sample of the EPSG:5514 height tiles at each pixel centre,
+      exactly as the sampling contract defines; nodata where the sampler returns none
+    storage:
+      format: geotiff
+      compression: deflate
+      predictor: 3
+      block_width_px: 256
+      block_height_px: 256
+    processing_version: '1'
+  rgb:
+    resolution_deg: 2.2457779374775424e-06
+    tile_width_px: 8192
+    tile_height_px: 8192
+    tile_pattern: wgs/rgb/tile_{ix}_{iy}.tif
+    bands:
+    - red
+    - green
+    - blue
+    dtype: uint8
+    mask: internal
+    storage:
+      format: geotiff
+      compression: jpeg
+      photometric: ycbcr
+      jpeg_quality: 90
+      block_width_px: 512
+      block_height_px: 512
+    source:
+      provider: CUZK
+      product: ORTOFOTO
+      source_id: cuzk-ortofoto
+      reprojection: server
+      service_url: https://ags.cuzk.gov.cz/arcgis1/rest/services/ORTOFOTO/MapServer
+    processing_version: '1'
+  tiles:
+    count: 5
+    index:
+    - - 10553
+      - 2164
+    - - 10559
+      - 2208
+    - - 10567
+      - 2170
+    - - 10578
+      - 2175
+    - - 10579
+      - 2169
 worlds_db:
   path: worlds.sqlite
-  schema_version: 1
+  schema_version: 2

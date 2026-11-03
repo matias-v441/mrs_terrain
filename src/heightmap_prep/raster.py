@@ -42,6 +42,9 @@ TAG_SOURCE_ID = "HEIGHTMAP_PREP_SOURCE"
 TAG_VERTICAL_DATUM = "HEIGHTMAP_PREP_VERTICAL_DATUM"
 TAG_VERTICAL_CRS = "HEIGHTMAP_PREP_VERTICAL_CRS"
 TAG_RESOLUTION = "HEIGHTMAP_PREP_RESOLUTION_M"
+#: The global pixel range of a height tile that was fetched, as
+#: ``col_min,row_min,col_max,row_max``.
+TAG_FILLED = "HEIGHTMAP_PREP_FILLED"
 
 #: Bumped whenever generated pixel values could change for identical inputs.
 PROCESSING_VERSION = "1"
@@ -54,6 +57,13 @@ TAG_RGB_FILLED = "HEIGHTMAP_PREP_RGB_FILLED"
 
 #: Bumped whenever generated RGB pixels could change for identical inputs.
 RGB_PROCESSING_VERSION = "1"
+
+#: The lattice window of a WGS height tile that holds heights, as
+#: ``col,row,width,height`` on the height lattice.
+TAG_WGS_FILLED = "HEIGHTMAP_PREP_WGS_FILLED"
+
+#: Bumped whenever generated WGS height pixels could change for identical inputs.
+WGS_HEIGHT_PROCESSING_VERSION = "1"
 
 #: Internal block edge of RGB tiles.  RGB tiles are tens of thousands of pixels
 #: across, so larger blocks keep the (mostly empty) block index small.
@@ -142,15 +152,14 @@ def write_raster(
     return path
 
 
-def write_raster_atomic(
+def _replace_atomically(
     path: Path,
-    data: np.ndarray,
+    write: Callable[[Path], None],
     *,
-    overwrite: bool = False,
-    validate: Callable[[Path], None] | None = None,
-    **kwargs: object,
+    overwrite: bool,
+    validate: Callable[[Path], None] | None,
 ) -> Path:
-    """Write to ``<path>.tmp``, validate it, and only then rename it into place.
+    """Run ``write`` on ``<path>.tmp``, validate it, and only then rename it into place.
 
     Specification section 18: an interrupted run must never leave a truncated or
     unvalidated tile behind that a later run would mistake for valid output.
@@ -161,10 +170,11 @@ def write_raster_atomic(
         raise OutputConflictError(
             f"{path} already exists; pass --overwrite to replace it"
         )
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.unlink(missing_ok=True)
     try:
-        write_raster(tmp, data, **kwargs)  # type: ignore[arg-type]
+        write(tmp)
         if validate is not None:
             validate(tmp)
         os.replace(tmp, path)
@@ -172,6 +182,56 @@ def write_raster_atomic(
         tmp.unlink(missing_ok=True)
         raise
     return path
+
+
+def write_raster_atomic(
+    path: Path,
+    data: np.ndarray,
+    *,
+    overwrite: bool = False,
+    validate: Callable[[Path], None] | None = None,
+    **kwargs: object,
+) -> Path:
+    """:func:`write_raster`, atomically (see :func:`_replace_atomically`)."""
+    return _replace_atomically(
+        path,
+        lambda tmp: write_raster(tmp, data, **kwargs),  # type: ignore[arg-type]
+        overwrite=overwrite,
+        validate=validate,
+    )
+
+
+def write_height_window_atomic(
+    path: Path,
+    data: np.ndarray,
+    *,
+    profile: Mapping[str, object],
+    col_off: int,
+    row_off: int,
+    overwrite: bool = False,
+    validate: Callable[[Path], None] | None = None,
+    tags: Mapping[str, str] | None = None,
+) -> Path:
+    """Write ``data`` into a window of an otherwise empty height tile, atomically.
+
+    ``profile`` is a :func:`storage_profile`; the tile is created at its full
+    size and the blocks outside the window are left out of the file, reading
+    back as NoData.  NaN in ``data`` is stored as the profile's NoData.
+    """
+    data = np.asarray(data)
+    if data.ndim != 2:
+        raise MalformedRasterError(f"expected a 2-D array, got shape {data.shape}")
+    nodata = float(profile["nodata"])  # type: ignore[arg-type]
+    values = np.where(np.isfinite(data), data, nodata).astype(np.float32)
+    window = rasterio.windows.Window(col_off, row_off, data.shape[1], data.shape[0])
+
+    def write(tmp: Path) -> None:
+        with rasterio.open(tmp, "w", **{**profile, "SPARSE_OK": True}) as dataset:
+            dataset.write(values, 1, window=window)
+            if tags:
+                dataset.update_tags(**{k: str(v) for k, v in tags.items()})
+
+    return _replace_atomically(path, write, overwrite=overwrite, validate=validate)
 
 
 def rgb_storage_profile(
@@ -228,30 +288,18 @@ def write_rgb_window_atomic(
         raise MalformedRasterError(
             f"expected a (4, height, width) uint8 RGBA array, got {rgba.dtype} {rgba.shape}"
         )
-    path = Path(path)
-    if path.exists() and not overwrite:
-        raise OutputConflictError(
-            f"{path} already exists; pass --overwrite to replace it"
-        )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.unlink(missing_ok=True)
     window = rasterio.windows.Window(col_off, row_off, rgba.shape[2], rgba.shape[1])
     valid = rgba[3] > 0
-    try:
+
+    def write(tmp: Path) -> None:
         with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True):
             with rasterio.open(tmp, "w", **profile) as dataset:
                 dataset.write(np.where(valid, rgba[:3], 0).astype(np.uint8), window=window)
                 dataset.write_mask(np.where(valid, 255, 0).astype(np.uint8), window=window)
                 if tags:
                     dataset.update_tags(**{k: str(v) for k, v in tags.items()})
-        if validate is not None:
-            validate(tmp)
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    return path
+
+    return _replace_atomically(path, write, overwrite=overwrite, validate=validate)
 
 
 def read_tags(path: Path) -> dict[str, str]:

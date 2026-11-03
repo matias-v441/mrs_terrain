@@ -116,6 +116,28 @@ class PixelRange:
             max(self.row_max, other.row_max),
         )
 
+    def contains(self, other: "PixelRange") -> bool:
+        return (
+            self.col_min <= other.col_min
+            and self.row_min <= other.row_min
+            and other.col_max <= self.col_max
+            and other.row_max <= self.row_max
+        )
+
+    def to_tag(self) -> str:
+        return f"{self.col_min},{self.row_min},{self.col_max},{self.row_max}"
+
+    @classmethod
+    def from_tag(cls, value: str | None) -> "PixelRange | None":
+        """Parse :meth:`to_tag` output; ``None`` if it is missing or malformed."""
+        try:
+            col_min, row_min, col_max, row_max = (int(part) for part in (value or "").split(","))
+        except ValueError:
+            return None
+        if col_max < col_min or row_max < row_min:
+            return None
+        return cls(col_min, row_min, col_max, row_max)
+
 
 #: Slack, in pixels, when deciding which pixels a bilinear sampler may read.  A
 #: query within a millimetre of a pixel-centre line can fall on either side of it

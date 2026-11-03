@@ -3,12 +3,13 @@
 This is the orchestration layer that ties acquisition (:mod:`.cuzk`), vertical
 conversion (:mod:`.crs`, :mod:`.raster`), the global tile grid (:mod:`.tiling`),
 the manifest (:mod:`.manifest`) and validation (:mod:`.validate`) together.
-Optionally it adds an orthophoto tile in EPSG:4326 for every height tile
-(:mod:`.rgb`), and it always records the worlds in ``worlds.sqlite``
-(:mod:`.worlds_db`).
+It also cuts every world's lat/lon bounding box into disjoint EPSG:4326 WGS
+tiles of heights and, optionally, orthophoto imagery (:mod:`.wgs`), and it
+records the worlds in ``worlds.sqlite`` (:mod:`.worlds_db`).
 
-The dataset holds exactly the tiles a bilinear sampler reads when queried
-anywhere inside the worlds' safety areas, borders included.  A world config that
+The EPSG:5514 tiles hold exactly what a bilinear sampler reads when queried
+anywhere inside the worlds' lat/lon bounding boxes, as the WGS tiles cover
+them, borders included.  A world config that
 cannot be prepared is skipped with a warning; only problems that affect every
 world, such as a failing source or missing PROJ grids, stop the run.
 """
@@ -22,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 import rasterio
@@ -58,7 +59,8 @@ from .errors import (
 from .manifest import (
     MANIFEST_FILENAME,
     Manifest,
-    RgbInfo,
+    WgsInfo,
+    WgsRgbInfo,
     grid_file_checksums,
     software_versions,
 )
@@ -67,6 +69,7 @@ from .raster import (
     PROCESSING_VERSION,
     RGB_BLOCK_PX,
     RGB_PROCESSING_VERSION,
+    TAG_FILLED,
     TAG_PACKAGE_VERSION,
     TAG_PROCESSING_VERSION,
     TAG_RESOLUTION,
@@ -76,14 +79,17 @@ from .raster import (
     TAG_SOURCE_ID,
     TAG_VERTICAL_CRS,
     TAG_VERTICAL_DATUM,
+    TAG_WGS_FILLED,
+    WGS_HEIGHT_PROCESSING_VERSION,
     convert_vertical,
     provenance_tags,
     read_tags,
     rgb_storage_profile,
+    storage_profile,
+    write_height_window_atomic,
     write_raster_atomic,
     write_rgb_window_atomic,
 )
-from .rgb import RgbGrid, RgbWindow
 from .sampling import TEST_POINTS_FILENAME, DatasetSampler, ReferencePoint, write_test_points
 from .sources import BaseHeightSource, BaseRgbSource
 from .tiling import (
@@ -98,8 +104,10 @@ from .validate import (
     validate_dataset,
     validate_rgb_tile,
     validate_tile,
+    validate_wgs_height_tile,
     validate_vertical_transformation,
 )
+from .wgs import LatticeWindow, WgsGrid, densified_ring
 from .worlds_db import write_worlds_db
 
 log = logging.getLogger(__name__)
@@ -110,9 +118,13 @@ class WorldPlan:
     """A world's footprint on the global tile grid."""
 
     world: WorldConfig
-    #: Every pixel a sampler may read for a query inside the safety area.
+    #: Every EPSG:5514 pixel a sampler may read for a query inside ``wgs_fill``.
     pixels: PixelRange
     tiles: list[TileIndex]
+    #: The safety area's lat/lon bounding box, snapped outward to the WGS
+    #: height lattice: where the WGS tiles hold data for this world.
+    wgs_fill: LatticeWindow
+    wgs_tiles: list[TileIndex]
 
 
 @dataclass
@@ -136,7 +148,9 @@ class PrepareResult:
     worlds: list[WorldConfig]
     plans: list[WorldPlan] = field(default_factory=list)
     outcomes: list[TileOutcome] = field(default_factory=list)
-    #: One per RGB tile; empty unless RGB imagery was requested.
+    #: One per WGS tile.
+    wgs_outcomes: list[TileOutcome] = field(default_factory=list)
+    #: One per WGS tile; empty unless RGB imagery was requested.
     rgb_outcomes: list[TileOutcome] = field(default_factory=list)
     report: ValidationReport = field(default_factory=ValidationReport)
     test_points: list[ReferencePoint] = field(default_factory=list)
@@ -156,17 +170,18 @@ class PrepareResult:
 
 
 def plan_world(
-    world: WorldConfig, grid: TileGrid, coverage: ProjectedBounds | None
+    world: WorldConfig, grid: TileGrid, wgs_grid: WgsGrid, coverage: ProjectedBounds | None
 ) -> WorldPlan:
-    """Find the pixels and tiles a sampler reads anywhere in ``world``'s safety area.
+    """Find what ``world`` needs: its WGS tiles and the EPSG:5514 pixels behind them.
 
-    The pixels are those around the safety area's bounding box.  A tile is only
-    needed when the polygon itself reaches the tile's sampling region, so a
-    diagonal safety area does not pull in tiles that merely share its box.
+    The WGS tiles hold data over the safety area's lat/lon bounding box, snapped
+    outward to the WGS height lattice.  Every EPSG:5514 pixel a sampler reads
+    anywhere in that box is fetched, which covers the safety area itself too.
+    Its edges are curves in EPSG:5514, so they are densified before projecting.
     """
-    xs, ys = project_points(
-        [lon for lon, _ in world.points], [lat for _, lat in world.points], target_epsg=5514
-    )
+    wgs_fill = wgs_grid.fill_for_lonlat(world.bounds)
+    lons, lats = densified_ring(*wgs_grid.height.window_bounds(wgs_fill))
+    xs, ys = project_points(lons, lats, target_epsg=5514)
     pixels = grid.sampling_pixels(xs, ys)
     needed = grid.pixels_bounds(pixels)
     if coverage is not None and not coverage.contains(needed):
@@ -175,18 +190,27 @@ def plan_world(
             f"{tuple(round(v, 1) for v in needed.as_tuple())}, which is not inside the "
             f"source coverage {coverage.as_tuple()}"
         )
+    # The box is a curved quadrilateral in EPSG:5514, so a tile its EPSG:5514
+    # bounding box merely touches may still be outside it.
     tiles = [
         tile
         for tile in grid.tiles_for_pixels(pixels)
         if polygon_intersects_bounds(xs, ys, grid.sampling_region(tile))
     ]
     log.debug(
-        "world %s: EPSG:5514 extent %s, pixels %s",
+        "world %s: EPSG:5514 extent %s, pixels %s, WGS fill %s",
         world.name,
         tuple(round(v, 3) for v in needed.as_tuple()),
         pixels,
+        wgs_fill,
     )
-    return WorldPlan(world=world, pixels=pixels, tiles=tiles)
+    return WorldPlan(
+        world=world,
+        pixels=pixels,
+        tiles=tiles,
+        wgs_fill=wgs_fill,
+        wgs_tiles=wgs_grid.tiles_for_window(wgs_fill),
+    )
 
 
 def merge_tile_requirements(
@@ -206,6 +230,25 @@ def merge_tile_requirements(
             previous = required.get(tile)
             required[tile] = inside if previous is None else previous.union(inside)
     # Reading order, so a run's tile order never depends on the worker count.
+    return dict(sorted(required.items(), key=lambda item: (item[0].iy, item[0].ix)))
+
+
+def merge_wgs_requirements(
+    plans: Sequence[WorldPlan], wgs_grid: WgsGrid
+) -> dict[TileIndex, LatticeWindow]:
+    """For each WGS tile, the height-lattice window its worlds need filled.
+
+    As for :func:`merge_tile_requirements`, worlds sharing a tile share one
+    window: the smallest one holding all their fills.
+    """
+    required: dict[TileIndex, LatticeWindow] = {}
+    for plan in plans:
+        for tile in plan.wgs_tiles:
+            inside = plan.wgs_fill.intersection(wgs_grid.height_tile_window(tile))
+            if inside is None:  # pragma: no cover - wgs_tiles come from the fill
+                continue
+            previous = required.get(tile)
+            required[tile] = inside if previous is None else previous.union(inside)
     return dict(sorted(required.items(), key=lambda item: (item[0].iy, item[0].ix)))
 
 
@@ -243,8 +286,8 @@ class _TileBuilder:
 
     # --- resume ----------------------------------------------------------
 
-    def _is_reusable(self, path: Path, tile: TileIndex) -> tuple[bool, str]:
-        """Whether an existing tile was produced by an equivalent run."""
+    def _is_reusable(self, path: Path, tile: TileIndex, pixels: PixelRange) -> tuple[bool, str]:
+        """Whether an existing tile was produced by an equivalent run and holds ``pixels``."""
         tags = read_tags(path)
         if not tags:
             return False, "tile carries no provenance metadata"
@@ -259,6 +302,9 @@ class _TileBuilder:
             actual = tags.get(key)
             if actual != expected:
                 return False, f"{key} is {actual!r}, this run produces {expected!r}"
+        filled = PixelRange.from_tag(tags.get(TAG_FILLED))
+        if filled is None or not filled.contains(pixels):
+            return False, "it holds heights for less than the worlds now need"
 
         report, _ = validate_tile(
             path,
@@ -280,7 +326,7 @@ class _TileBuilder:
         path.parent.mkdir(parents=True, exist_ok=True)
 
         if path.exists():
-            reusable, reason = self._is_reusable(path, tile)
+            reusable, reason = self._is_reusable(path, tile, pixels)
             if reusable and not self.options.overwrite:
                 log.debug("tile %s: reusing %s", tile, path.name)
                 return TileOutcome(tile, "reused", path, duration_s=time.monotonic() - started)
@@ -347,7 +393,7 @@ class _TileBuilder:
             compression=self.manifest.compression,
             predictor=self.manifest.predictor,
             cog=self.options.cog,
-            tags=self.expected_tags,
+            tags={**self.expected_tags, TAG_FILLED: pixels.to_tag()},
         )
 
         duration = time.monotonic() - started
@@ -377,25 +423,94 @@ class _TileBuilder:
         report.raise_for_errors(f"tile {tile}")
 
 
-class _RgbTileBuilder:
-    """Builds the RGB tile of one height tile at a time; thread safe like :class:`_TileBuilder`.
+class _WgsHeightTileBuilder:
+    """Builds one WGS height tile at a time from the finished EPSG:5514 tiles.
 
-    The RGB tile spans its height tile's whole sampling region, but only the
-    imagery around the pixels the worlds need from that height tile is fetched.
+    Each pixel is the dataset's own bilinear sample at the pixel centre, so a
+    WGS height pixel is exactly what a sampler returns there.  The tiles are
+    derived from data already on disk, so they are rebuilt on every run.
+    """
+
+    def __init__(self, *, manifest: Manifest, output_dir: Path, source_id: str) -> None:
+        assert manifest.wgs is not None
+        self.manifest = manifest
+        self.wgs_grid = manifest.wgs.grid()
+        self.output_dir = Path(output_dir)
+        self.tags = {
+            TAG_PACKAGE_VERSION: __version__,
+            TAG_PROCESSING_VERSION: WGS_HEIGHT_PROCESSING_VERSION,
+            TAG_SOURCE_ID: source_id,
+            TAG_VERTICAL_DATUM: manifest.vertical_datum,
+            TAG_VERTICAL_CRS: manifest.vertical_crs,
+        }
+
+    def build(self, tile: TileIndex, fill: LatticeWindow) -> TileOutcome:
+        started = time.monotonic()
+        path = self.manifest.wgs_height_path(self.output_dir, tile)
+        window = self.wgs_grid.height_tile_window(tile)
+        lattice = self.wgs_grid.height
+        res = lattice.resolution_deg
+        lons = lattice.origin_lon + (np.arange(fill.col_min, fill.col_end) + 0.5) * res
+        lats = lattice.origin_lat - (np.arange(fill.row_min, fill.row_end) + 0.5) * res
+        with DatasetSampler(self.output_dir, self.manifest) as sampler:
+            heights = sampler.sample_many(lons[np.newaxis, :], lats[:, np.newaxis])
+
+        col_off, row_off = fill.offset_in(window)
+        write_height_window_atomic(
+            path,
+            heights,
+            profile=storage_profile(
+                width=window.width,
+                height=window.height,
+                transform=lattice.window_transform(window),
+                crs=self.manifest.wgs.crs,
+                nodata=self.manifest.nodata,
+                block_size_px=self.manifest.wgs.height_block_px,
+            ),
+            col_off=col_off,
+            row_off=row_off,
+            overwrite=True,
+            validate=lambda tmp: self._validate_pending(tmp, tile),
+            tags={**self.tags, TAG_WGS_FILLED: fill.to_tag()},
+        )
+        duration = time.monotonic() - started
+        log.debug(
+            "wgs height tile %s: %d/%d px of %s with heights, %.2fs",
+            tile,
+            int(np.isfinite(heights).sum()),
+            heights.size,
+            fill,
+            duration,
+        )
+        return TileOutcome(tile, "written", path, duration_s=duration)
+
+    def _validate_pending(self, tmp_path: Path, tile: TileIndex) -> None:
+        report = validate_wgs_height_tile(
+            tmp_path, self.manifest, tile, self.output_dir, report=ValidationReport()
+        )
+        for warning in report.warnings:
+            log.warning("%s", warning)
+        report.raise_for_errors(f"wgs height tile {tile}")
+
+
+class _RgbTileBuilder:
+    """Builds one WGS RGB tile at a time; thread safe like :class:`_TileBuilder`.
+
+    The file spans the whole WGS tile, but only imagery for the height-lattice
+    window the worlds need is fetched, so it covers exactly the area the WGS
+    height tile of the same index holds heights for.
     """
 
     def __init__(
         self,
         *,
-        grid: TileGrid,
         manifest: Manifest,
         output_dir: Path,
         source: BaseRgbSource,
         options: PrepareOptions,
     ) -> None:
-        assert manifest.rgb is not None
-        self.grid = grid
-        self.rgb_grid = manifest.rgb.grid()
+        assert manifest.wgs is not None and manifest.wgs.rgb is not None
+        self.wgs_grid = manifest.wgs.grid()
         self.manifest = manifest
         self.output_dir = Path(output_dir)
         self.source = source
@@ -409,7 +524,7 @@ class _RgbTileBuilder:
         }
 
     def _is_reusable(
-        self, path: Path, tile: TileIndex, window: RgbWindow, fill: RgbWindow
+        self, path: Path, tile: TileIndex, window: LatticeWindow, fill: LatticeWindow
     ) -> tuple[bool, str]:
         """Whether an existing RGB tile has this run's extent, provenance and imagery."""
         tags = read_tags(path)
@@ -420,12 +535,12 @@ class _RgbTileBuilder:
             actual = tags.get(key)
             if actual != expected:
                 return False, f"{key} is {actual!r}, this run produces {expected!r}"
-        filled = RgbWindow.from_tag(tags.get(TAG_RGB_FILLED))
+        filled = LatticeWindow.from_tag(tags.get(TAG_RGB_FILLED))
         if filled is None or not filled.contains(fill):
             return False, "it holds imagery for less than the worlds now need"
         try:
             with rasterio.open(path) as dataset:
-                existing = self.rgb_grid.window_of_transform(
+                existing = self.wgs_grid.rgb.window_of_transform(
                     dataset.transform, dataset.width, dataset.height
                 )
         except Exception as exc:
@@ -437,14 +552,13 @@ class _RgbTileBuilder:
             return False, f"existing tile failed validation: {report.errors[0]}"
         return True, ""
 
-    def build(self, tile: TileIndex, pixels: PixelRange) -> TileOutcome:
+    def build(self, tile: TileIndex, height_fill: LatticeWindow) -> TileOutcome:
         started = time.monotonic()
-        path = self.manifest.rgb_tile_path(self.output_dir, tile)
+        path = self.manifest.wgs_rgb_path(self.output_dir, tile)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        window = self.rgb_grid.tile_window(self.grid, tile)
-        fill = self.rgb_grid.window_for_projected(self.grid.pixels_bounds(pixels))
-        fill = fill.intersection(window) or fill  # always inside; guards float noise
+        window = self.wgs_grid.rgb_tile_window(tile)
+        fill = height_fill.scaled(self.wgs_grid.height_factor)
 
         if path.exists():
             reusable, reason = self._is_reusable(path, tile, window, fill)
@@ -458,14 +572,16 @@ class _RgbTileBuilder:
                 )
             log.debug("rgb tile %s: regenerating (%s)", tile, reason or "overwrite requested")
 
+        lattice = self.wgs_grid.rgb
         try:
-            rgba = self.source.read_rgba(self.rgb_grid, fill)
+            rgba = self.source.read_rgba(lattice, fill)
         except SourceError as exc:
             raise SourceError(
-                f"rgb tile {tile} (bounds {self.rgb_grid.window_bounds(fill)} in "
+                f"rgb tile {tile} (bounds {lattice.window_bounds(fill)} in "
                 f"{self.source.crs}): {exc}"
             ) from exc
 
+        rgb = self.manifest.wgs.rgb
         col_off, row_off = fill.offset_in(window)
         write_rgb_window_atomic(
             path,
@@ -473,10 +589,10 @@ class _RgbTileBuilder:
             profile=rgb_storage_profile(
                 width=window.width,
                 height=window.height,
-                transform=self.rgb_grid.window_transform(window),
-                crs=self.manifest.rgb.crs,
+                transform=lattice.window_transform(window),
+                crs=self.manifest.wgs.crs,
                 jpeg_quality=self.options.rgb_jpeg_quality,
-                block_size_px=self.manifest.rgb.block_width_px,
+                block_size_px=rgb.block_width_px,
             ),
             col_off=col_off,
             row_off=row_off,
@@ -508,19 +624,33 @@ def _build_rgb_source(options: PrepareOptions) -> BaseRgbSource:
     )
 
 
-def _rgb_info(source: BaseRgbSource, options: PrepareOptions) -> RgbInfo:
-    grid = RgbGrid.from_metres(options.rgb_resolution_m)
-    return RgbInfo(
+def _wgs_info(options: PrepareOptions, rgb_source: BaseRgbSource | None) -> WgsInfo:
+    grid = WgsGrid.from_metres(
+        options.rgb_resolution_m,
+        tile_size_px=options.wgs_tile_size_px,
+        height_factor=options.wgs_height_factor,
+    )
+    rgb = (
+        WgsRgbInfo(
+            source_id=rgb_source.source_id,
+            source_service_url=getattr(rgb_source, "service_url", None),
+            source_provider=getattr(rgb_source, "provider", "CUZK"),
+            source_product=getattr(rgb_source, "product", "ORTOFOTO"),
+            jpeg_quality=options.rgb_jpeg_quality,
+            block_width_px=RGB_BLOCK_PX,
+            block_height_px=RGB_BLOCK_PX,
+            processing_version=RGB_PROCESSING_VERSION,
+        )
+        if rgb_source is not None
+        else None
+    )
+    return WgsInfo(
         resolution_m=options.rgb_resolution_m,
         resolution_deg=grid.resolution_deg,
-        source_id=source.source_id,
-        source_service_url=getattr(source, "service_url", None),
-        source_provider=getattr(source, "provider", "CUZK"),
-        source_product=getattr(source, "product", "ORTOFOTO"),
-        jpeg_quality=options.rgb_jpeg_quality,
-        block_width_px=RGB_BLOCK_PX,
-        block_height_px=RGB_BLOCK_PX,
-        processing_version=RGB_PROCESSING_VERSION,
+        tile_size_px=grid.tile_size_px,
+        height_factor=grid.height_factor,
+        height_processing_version=WGS_HEIGHT_PROCESSING_VERSION,
+        rgb=rgb,
     )
 
 
@@ -645,17 +775,18 @@ def _restore_manifest(output_dir: Path, previous: bytes | None) -> None:
         log.warning("could not restore the previous manifest in %s: %s", output_dir, exc)
 
 
-def _tile_patterns(manifest: Manifest) -> list[str]:
-    """The tile pattern of every kind of tile the dataset holds."""
+def _tile_directories(output_dir: Path, manifest: Manifest) -> list[Path]:
+    """The directory of every kind of tile the dataset holds."""
     patterns = [manifest.tile_pattern]
-    if manifest.rgb is not None:
-        patterns.append(manifest.rgb.tile_pattern)
-    return patterns
+    if manifest.wgs is not None:
+        patterns.append(manifest.wgs.height_tile_pattern)
+        if manifest.wgs.rgb is not None:
+            patterns.append(manifest.wgs.rgb.tile_pattern)
+    return [output_dir / Path(pattern.format(ix=0, iy=0)).parent for pattern in patterns]
 
 
 def _clean_stale_temporaries(output_dir: Path, manifest: Manifest) -> None:
-    for pattern in _tile_patterns(manifest):
-        directory = output_dir / Path(pattern.format(ix=0, iy=0)).parent
+    for directory in _tile_directories(output_dir, manifest):
         if not directory.is_dir():
             continue
         for leftover in directory.glob("*.tmp"):
@@ -688,8 +819,7 @@ def _discard_unneeded_tiles(
     needed = {tile for plan in plans for tile in plan.tiles}
     for tile in manifest.tiles:
         if tile not in needed:
-            for pattern in _tile_patterns(manifest):
-                (output_dir / pattern.format(ix=tile.ix, iy=tile.iy)).unlink(missing_ok=True)
+            manifest.tile_path(output_dir, tile).unlink(missing_ok=True)
             log.info("removed tile %s, which only skipped worlds needed", tile)
     manifest.set_tiles(list(needed))
 
@@ -802,12 +932,14 @@ def prepare_worlds(
             grid.tile_span_y,
         )
 
+        wgs_info = _wgs_info(options, rgb_source)
+        wgs_grid = wgs_info.grid()
         coverage = height_source.coverage()
         plans: list[WorldPlan] = []
         rgb_coverage = rgb_source.coverage() if rgb_source is not None else None
         for world in worlds:
             try:
-                plan = plan_world(world, grid, coverage)
+                plan = plan_world(world, grid, wgs_grid, coverage)
                 needed = grid.pixels_bounds(plan.pixels)
                 if rgb_coverage is not None and not rgb_coverage.contains(needed):
                     raise OutOfCoverageError(
@@ -841,8 +973,7 @@ def prepare_worlds(
             operation=operation,
             options=options,
         )
-        if rgb_source is not None:
-            manifest.rgb = _rgb_info(rgb_source, options)
+        manifest.wgs = wgs_info
         manifest.set_tiles(list(required))
 
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -916,25 +1047,27 @@ def prepare_worlds(
             remaining = set(manifest.tiles)
             outcomes = [o for o in outcomes if o.tile in remaining]
 
+        # The WGS tiles are cut for the worlds still in the dataset only.
+        wgs_required = merge_wgs_requirements(plans, wgs_grid)
+        wgs_info.set_tiles(list(wgs_required))
+        wgs_builder = _WgsHeightTileBuilder(
+            manifest=manifest, output_dir=output_dir, source_id=height_source.source_id
+        )
+        # Sequential: each build opens its own sampler over the finished tiles.
+        wgs_outcomes = _run_builder(wgs_builder, wgs_required, workers=1)
+        log.info("wgs height tiles: %d written", len(wgs_outcomes))
+
         rgb_outcomes: list[TileOutcome] = []
-        rgb_bounds: dict[TileIndex, tuple[float, float, float, float]] = {}
         if rgb_source is not None:
             rgb_builder = _RgbTileBuilder(
-                grid=grid,
                 manifest=manifest,
                 output_dir=output_dir,
                 source=rgb_source,
                 options=options,
             )
-            # Only the worlds still in the dataset decide what imagery to fetch.
-            rgb_outcomes = _run_builder(
-                rgb_builder, merge_tile_requirements(plans, grid), options.workers
-            )
+            rgb_outcomes = _run_builder(rgb_builder, wgs_required, options.workers)
             written = sum(1 for o in rgb_outcomes if o.action == "written")
             log.info("rgb tiles: %d written, %d reused", written, len(rgb_outcomes) - written)
-            for outcome in rgb_outcomes:
-                with rasterio.open(outcome.path) as dataset:
-                    rgb_bounds[outcome.tile] = tuple(dataset.bounds)
 
         test_points = _write_test_points(output_dir, manifest, worlds, heights)
         log.info(
@@ -945,7 +1078,7 @@ def prepare_worlds(
             manifest,
             worlds,
             {plan.world.name: plan.tiles for plan in plans},
-            rgb_bounds,
+            {plan.world.name: plan.wgs_tiles for plan in plans},
         )
         manifest.write(output_dir)
         log.info("recorded %d world(s) in %s", len(worlds), worlds_db)
@@ -968,6 +1101,7 @@ def prepare_worlds(
             worlds=worlds,
             plans=plans,
             outcomes=outcomes,
+            wgs_outcomes=wgs_outcomes,
             rgb_outcomes=rgb_outcomes,
             report=report,
             test_points=test_points,
@@ -981,13 +1115,14 @@ def prepare_worlds(
 
 
 def _run_builder(
-    builder: _TileBuilder | _RgbTileBuilder,
-    required: dict[TileIndex, PixelRange],
+    builder: _TileBuilder | _WgsHeightTileBuilder | _RgbTileBuilder,
+    required: Mapping[TileIndex, PixelRange | LatticeWindow],
     workers: int,
 ) -> list[TileOutcome]:
     """Build every required tile, optionally across a bounded thread pool.
 
-    ``builder`` is a height or an RGB tile builder; both build one tile per call.
+    ``builder`` builds one tile per call from what that tile needs: an
+    EPSG:5514 pixel range or a WGS height-lattice window.
     """
     items = list(required.items())
     if workers <= 1 or len(items) <= 1:

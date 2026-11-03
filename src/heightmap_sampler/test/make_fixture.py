@@ -111,7 +111,7 @@ def write_tile(root: Path, ix: int, iy: int) -> None:
 
 def write_manifest(root: Path) -> None:
     manifest = {
-        "format_version": 1,
+        "format_version": 2,
         "status": "complete",
         "heightmap": {
             "horizontal_crs": HORIZONTAL_CRS,

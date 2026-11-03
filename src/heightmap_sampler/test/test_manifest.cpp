@@ -17,7 +17,7 @@ namespace
 {
 
 const char * kValidManifest =
-  R"(format_version: 1
+  R"(format_version: 2
 status: complete
 heightmap:
   horizontal_crs: EPSG:5514
@@ -111,7 +111,7 @@ TEST(Manifest, RejectsAnIncompleteDataset) {
 }
 
 TEST(Manifest, RejectsAnUnknownFormatVersion) {
-  const TempDataset dataset{manifest_with("format_version: 1", "format_version: 2")};
+  const TempDataset dataset{manifest_with("format_version: 2", "format_version: 1")};
   EXPECT_THROW(load_manifest(dataset.path()), DatasetError);
 }
 

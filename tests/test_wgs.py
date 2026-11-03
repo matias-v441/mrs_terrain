@@ -1,4 +1,4 @@
-"""The RGB lattice, the ČÚZK orthophoto source and RGB tile storage."""
+"""The WGS tiling, the ČÚZK orthophoto source and RGB tile storage."""
 
 from __future__ import annotations
 
@@ -27,33 +27,40 @@ from heightmap_prep.errors import (
     SourceHttpError,
 )
 from heightmap_prep.raster import rgb_storage_profile, write_rgb_window_atomic
-from heightmap_prep.rgb import (
+from heightmap_prep.tiling import TileIndex
+from heightmap_prep.wgs import (
     METRES_PER_DEGREE,
-    RgbGrid,
-    RgbWindow,
-    projected_to_lonlat_bounds,
+    LatticeWindow,
+    WgsGrid,
+    densified_ring,
 )
-from heightmap_prep.tiling import TileGrid, TileIndex
 
 from conftest import SyntheticRgbSource
 
-GRID = TileGrid.from_options(2.0, 128, -999_999.6, -800_000.12)
-RGB = RgbGrid.from_metres(1.0)
+WGS = WgsGrid.from_metres(1.0, tile_size_px=256, height_factor=8)
+RGB = WGS.rgb
 
 #: Around the conftest test area, near Prague.
 LONLAT = (14.4166, 50.0762, 14.4239, 50.0808)
 
 
-# --- the lattice ---------------------------------------------------------
+# --- the lattices ----------------------------------------------------------
 
 
 def test_the_resolution_is_square_degrees_from_metres_north_south() -> None:
-    assert RgbGrid.from_metres(0.25).resolution_deg == pytest.approx(0.25 / METRES_PER_DEGREE)
+    grid = WgsGrid.from_metres(0.25)
+    assert grid.resolution_deg == pytest.approx(0.25 / METRES_PER_DEGREE)
+    assert grid.height.resolution_deg == pytest.approx(8 * grid.resolution_deg)
+    assert (grid.tile_size_px, grid.height_tile_px) == (8192, 1024)
 
 
-def test_a_non_positive_resolution_is_refused() -> None:
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"resolution_m": 0.0}, {"resolution_m": 1.0, "tile_size_px": 100, "height_factor": 8}],
+)
+def test_an_unusable_tiling_is_refused(kwargs) -> None:
     with pytest.raises(ConfigError):
-        RgbGrid.from_metres(0.0)
+        WgsGrid.from_metres(**kwargs)
 
 
 def test_windows_snap_outward_onto_the_lattice() -> None:
@@ -67,53 +74,81 @@ def test_windows_snap_outward_onto_the_lattice() -> None:
 
 
 def test_a_lattice_edge_does_not_pull_in_an_extra_pixel() -> None:
-    window = RgbWindow(1000, 2000, 30, 40)
+    window = LatticeWindow(1000, 2000, 30, 40)
     assert RGB.window_for_lonlat(RGB.window_bounds(window)) == window
 
 
 def test_a_transform_maps_back_to_its_window() -> None:
-    window = RgbWindow(86_666_048, 17_770_634, 981, 669)
+    window = LatticeWindow(86_666_048, 17_770_634, 981, 669)
     transform = RGB.window_transform(window)
     assert RGB.window_of_transform(transform, 981, 669) == window
 
 
 def test_an_off_lattice_transform_is_recognised() -> None:
-    window = RgbWindow(100, 100, 10, 10)
+    window = LatticeWindow(100, 100, 10, 10)
     transform = RGB.window_transform(window)
     shifted = transform @ transform.translation(0.5, 0.0)
     assert RGB.window_of_transform(shifted, 10, 10) is None
     assert RGB.window_of_transform(transform @ transform.scale(2.0), 10, 10) is None
+    assert WGS.height.window_of_transform(transform, 10, 10) is None
 
 
-def test_an_rgb_tile_covers_its_height_tiles_sampling_region() -> None:
-    tile = GRID.index_for_point(-743_000.0, -1_044_000.0)
-    window = RGB.tile_window(GRID, tile)
-    need = projected_to_lonlat_bounds(GRID.sampling_region(tile))
-    west, south, east, north = RGB.window_bounds(window)
-    assert west <= need[0] and south <= need[1] and east >= need[2] and north >= need[3]
+# --- the tiles -------------------------------------------------------------
 
 
-def test_densified_bounds_exceed_the_corners_alone() -> None:
-    """Krovak edges are curves in lon/lat; corners alone would cut them off."""
-    bounds = GRID.tile_bounds(TileIndex(1000, 950))
-    dense = projected_to_lonlat_bounds(bounds)
-    corners = projected_to_lonlat_bounds(bounds, samples=1)
-    assert dense[0] <= corners[0] and dense[1] <= corners[1]
-    assert dense[2] >= corners[2] and dense[3] >= corners[3]
+def test_neighbouring_tiles_abut_without_overlapping() -> None:
+    tile = WGS.tile_index(14.42, 50.078)
+    here = WGS.rgb_tile_window(tile)
+    for neighbour in (TileIndex(tile.ix + 1, tile.iy), TileIndex(tile.ix, tile.iy + 1)):
+        there = WGS.rgb_tile_window(neighbour)
+        assert here.intersection(there) is None
+        assert (there.col_min, there.row_min) in {(here.col_end, here.row_min), (here.col_min, here.row_end)}
+    assert WGS.tile_bounds(TileIndex(tile.ix + 1, tile.iy))[0] == WGS.tile_bounds(tile)[2]
 
 
-def test_neighbouring_rgb_tiles_overlap_on_the_same_lattice() -> None:
-    tile = GRID.index_for_point(-743_000.0, -1_044_000.0)
-    left = RGB.tile_window(GRID, tile)
-    right = RGB.tile_window(GRID, TileIndex(tile.ix + 1, tile.iy))
-    assert left.intersection(right) is not None
+def test_a_points_tile_contains_it() -> None:
+    for lon, lat in ((14.42, 50.078), (-0.001, 51.5), (179.99, -45.0)):
+        west, south, east, north = WGS.tile_bounds(WGS.tile_index(lon, lat))
+        assert west <= lon < east and south < lat <= north
+
+
+def test_height_and_rgb_tiles_of_one_index_cover_the_same_area() -> None:
+    tile = WGS.tile_index(14.42, 50.078)
+    height = WGS.height.window_bounds(WGS.height_tile_window(tile))
+    rgb = RGB.window_bounds(WGS.rgb_tile_window(tile))
+    assert height == pytest.approx(rgb, abs=1e-12)
+    assert WGS.rgb_tile_window(tile).width == WGS.height_tile_window(tile).width * 8
+
+
+def test_the_fill_covers_the_box_on_the_height_lattice() -> None:
+    fill = WGS.fill_for_lonlat(LONLAT)
+    west, south, east, north = WGS.height.window_bounds(fill)
+    res = WGS.height.resolution_deg
+    assert west <= LONLAT[0] < west + res and east - res < LONLAT[2] <= east
+    assert south <= LONLAT[1] < south + res and north - res < LONLAT[3] <= north
+    # The same area on the RGB lattice.
+    assert RGB.window_bounds(fill.scaled(8)) == pytest.approx((west, south, east, north), abs=1e-12)
+
+
+def test_a_fill_across_a_tile_edge_touches_both_tiles() -> None:
+    n = WGS.height_tile_px
+    fill = LatticeWindow(5 * n - 3, 7 * n + 1, 6, 4)
+    assert WGS.tiles_for_window(fill) == [TileIndex(4, 7), TileIndex(5, 7)]
+    assert WGS.tiles_for_window(LatticeWindow(5 * n, 7 * n, n, n)) == [TileIndex(5, 7)]
 
 
 def test_window_tags_round_trip() -> None:
-    window = RgbWindow(12, 34, 56, 78)
-    assert RgbWindow.from_tag(window.to_tag()) == window
+    window = LatticeWindow(12, 34, 56, 78)
+    assert LatticeWindow.from_tag(window.to_tag()) == window
     for bad in (None, "", "1,2,3", "a,b,c,d", "1,2,0,4"):
-        assert RgbWindow.from_tag(bad) is None
+        assert LatticeWindow.from_tag(bad) is None
+
+
+def test_the_densified_ring_walks_the_rectangle() -> None:
+    xs, ys = densified_ring(1.0, 2.0, 3.0, 4.0, samples=4)
+    assert len(xs) == len(ys) == 4 * 5
+    assert set(zip(xs.tolist(), ys.tolist())) >= {(1.0, 4.0), (3.0, 4.0), (3.0, 2.0), (1.0, 2.0)}
+    assert xs.min() == 1.0 and xs.max() == 3.0 and ys.min() == 2.0 and ys.max() == 4.0
 
 
 # --- splitting and stitching ---------------------------------------------
@@ -121,7 +156,7 @@ def test_window_tags_round_trip() -> None:
 
 def test_large_windows_are_split_into_server_sized_requests() -> None:
     source = SyntheticRgbSource(max_request_px=100)
-    window = RgbWindow(1_000_000, 500_000, 250, 130)
+    window = LatticeWindow(1_000_000, 500_000, 250, 130)
     mosaic = source.read_rgba(RGB, window)
     assert len(source.requests) == 3 * 2
     whole = SyntheticRgbSource().read_rgba(RGB, window)
@@ -190,7 +225,7 @@ def ortho(handler, **kwargs) -> CuzkOrthophotoSource:
     )
 
 
-WINDOW = RgbWindow(1_000_000, 500_000, 40, 30)
+WINDOW = LatticeWindow(1_000_000, 500_000, 40, 30)
 
 
 def test_the_orthophoto_service_defaults() -> None:
@@ -289,7 +324,7 @@ def test_the_cache_avoids_a_second_render(tmp_path: Path) -> None:
 # --- storage -------------------------------------------------------------
 
 
-def write_tile(path: Path, *, window: RgbWindow, fill: RgbWindow, rgba=None, **kwargs) -> Path:
+def write_tile(path: Path, *, window: LatticeWindow, fill: LatticeWindow, rgba=None, **kwargs) -> Path:
     if rgba is None:
         rgba = SyntheticRgbSource().read_rgba(RGB, fill)
     col_off, row_off = fill.offset_in(window)
@@ -309,8 +344,8 @@ def write_tile(path: Path, *, window: RgbWindow, fill: RgbWindow, rgba=None, **k
 
 
 def test_only_the_filled_window_holds_imagery(tmp_path: Path) -> None:
-    window = RgbWindow(1_000_000, 500_000, 3000, 2000)
-    fill = RgbWindow(1_001_000, 500_700, 300, 200)
+    window = LatticeWindow(1_000_000, 500_000, 3000, 2000)
+    fill = LatticeWindow(1_001_000, 500_700, 300, 200)
     path = write_tile(tmp_path / "tile.tif", window=window, fill=fill)
     with rasterio.open(path) as dataset:
         assert (dataset.width, dataset.height, dataset.count) == (3000, 2000, 3)
@@ -326,7 +361,7 @@ def test_only_the_filled_window_holds_imagery(tmp_path: Path) -> None:
 
 
 def test_alpha_becomes_the_mask(tmp_path: Path) -> None:
-    window = RgbWindow(0, 0, 64, 64)
+    window = LatticeWindow(0, 0, 64, 64)
     rgba = np.full((4, 64, 64), 200, dtype=np.uint8)
     rgba[3, :, :10] = 0
     path = write_tile(tmp_path / "tile.tif", window=window, fill=window, rgba=rgba)
@@ -336,14 +371,14 @@ def test_alpha_becomes_the_mask(tmp_path: Path) -> None:
 
 
 def test_an_existing_tile_is_not_overwritten_by_default(tmp_path: Path) -> None:
-    window = RgbWindow(0, 0, 16, 16)
+    window = LatticeWindow(0, 0, 16, 16)
     path = write_tile(tmp_path / "tile.tif", window=window, fill=window)
     with pytest.raises(OutputConflictError):
         write_tile(path, window=window, fill=window)
 
 
 def test_a_failed_validation_leaves_nothing_behind(tmp_path: Path) -> None:
-    window = RgbWindow(0, 0, 16, 16)
+    window = LatticeWindow(0, 0, 16, 16)
 
     def reject(tmp: Path) -> None:
         raise MalformedRasterError("no")
@@ -354,6 +389,6 @@ def test_a_failed_validation_leaves_nothing_behind(tmp_path: Path) -> None:
 
 
 def test_only_rgba_uint8_is_accepted(tmp_path: Path) -> None:
-    window = RgbWindow(0, 0, 4, 4)
+    window = LatticeWindow(0, 0, 4, 4)
     with pytest.raises(MalformedRasterError):
         write_tile(tmp_path / "t.tif", window=window, fill=window, rgba=np.zeros((3, 4, 4), np.uint8))

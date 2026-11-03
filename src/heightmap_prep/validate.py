@@ -13,7 +13,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import TYPE_CHECKING, Iterable, Sequence
 
 import numpy as np
 import rasterio
@@ -26,10 +26,13 @@ from .crs import (
     crs_matches,
     epsg_code_of,
 )
-from .errors import ValidationError
+from .errors import ConfigError, ValidationError
 from .manifest import FORMAT_VERSION, STATUS_COMPLETE, Manifest
 from .sampling import DatasetSampler, read_test_points
 from .tiling import TileGrid, TileIndex, parse_tile_filename
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .wgs import Lattice, LatticeWindow
 
 log = logging.getLogger(__name__)
 
@@ -138,18 +141,28 @@ def validate_manifest(manifest: Manifest, report: ValidationReport | None = None
     if manifest.block_width_px <= 0 or manifest.block_height_px <= 0:
         report.error("manifest storage block dimensions must be positive")
 
-    if manifest.rgb is not None:
-        rgb = manifest.rgb
-        if epsg_code_of(rgb.crs) != 4326:
-            report.error(f"manifest rgb.crs must be EPSG:4326, got {rgb.crs!r}")
-        if not (rgb.resolution_deg > 0 and rgb.resolution_m > 0):
+    if manifest.wgs is not None:
+        wgs = manifest.wgs
+        if epsg_code_of(wgs.crs) != 4326:
+            report.error(f"manifest wgs.crs must be EPSG:4326, got {wgs.crs!r}")
+        if not (wgs.resolution_deg > 0 and wgs.resolution_m > 0):
             report.error(
-                f"manifest rgb resolution must be positive, got {rgb.resolution_m} m "
-                f"/ {rgb.resolution_deg} deg"
+                f"manifest wgs resolution must be positive, got {wgs.resolution_m} m "
+                f"/ {wgs.resolution_deg} deg"
             )
-        _check_pattern(rgb.tile_pattern, "rgb.tile_pattern", report)
-        if rgb.tile_pattern == manifest.tile_pattern:
-            report.error("manifest rgb.tile_pattern must differ from storage.tile_pattern")
+        else:
+            try:
+                wgs.grid()
+            except ConfigError as exc:
+                report.error(f"manifest wgs tiling is unusable: {exc}")
+        patterns = {"storage.tile_pattern": manifest.tile_pattern}
+        patterns["wgs.height.tile_pattern"] = wgs.height_tile_pattern
+        if wgs.rgb is not None:
+            patterns["wgs.rgb.tile_pattern"] = wgs.rgb.tile_pattern
+        for key, pattern in list(patterns.items())[1:]:
+            _check_pattern(pattern, key, report)
+        if len(set(patterns.values())) != len(patterns):
+            report.error(f"manifest tile patterns must all differ: {patterns}")
 
     return report
 
@@ -511,16 +524,176 @@ def validate_test_points(
     return report
 
 
-# --- RGB tiles -------------------------------------------------------------
-
-#: How far, in metres, an RGB tile may fall short of its height tile's sampling
-#: region before that is an error.  Generous enough for the difference between
-#: PROJ's grid-based and Helmert S-JTSK -> WGS84 operations, which is below 1 m.
-RGB_EXTENT_TOLERANCE_M = 2.0
+# --- WGS tiles -------------------------------------------------------------
 
 #: Fewer valid pixels than this, as a fraction of a tile's filled window, is
 #: worth a warning: the source should cover every safety area completely.
-RGB_MIN_COVERAGE = 0.99
+WGS_MIN_COVERAGE = 0.99
+
+#: How many valid WGS height pixels are re-sampled from the EPSG:5514 tiles.
+WGS_SPOT_CHECKS = 16
+
+
+def _check_wgs_layout(
+    dataset: rasterio.DatasetReader,
+    lattice: "Lattice",
+    expected: "LatticeWindow",
+    label: str,
+    report: ValidationReport,
+) -> bool:
+    """CRS and lattice placement of a WGS tile; ``False`` if it is off the lattice."""
+    if not crs_matches(dataset.crs, 4326):
+        report.error(f"{label}: CRS is EPSG:{epsg_code_of(dataset.crs)}, expected EPSG:4326")
+    window = lattice.window_of_transform(dataset.transform, dataset.width, dataset.height)
+    if window is None:
+        report.error(
+            f"{label}: geotransform {tuple(dataset.transform)[:6]} is not on the "
+            f"{lattice.resolution_deg} deg lattice"
+        )
+        return False
+    if window != expected:
+        report.error(f"{label}: spans {window}, the tile is {expected}")
+        return False
+    return True
+
+
+def _filled_window(
+    dataset: rasterio.DatasetReader,
+    tag: str,
+    tile_window: "LatticeWindow",
+    label: str,
+    report: ValidationReport,
+) -> "LatticeWindow | None":
+    from .wgs import LatticeWindow
+
+    filled = LatticeWindow.from_tag(dataset.tags().get(tag))
+    if filled is None or not tile_window.contains(filled):
+        report.error(f"{label}: {tag} is {dataset.tags().get(tag)!r}, not a window inside the tile")
+        return None
+    return filled
+
+
+def validate_wgs_height_tile(
+    path: Path,
+    manifest: Manifest,
+    tile: TileIndex,
+    dataset_dir: Path,
+    *,
+    report: ValidationReport | None = None,
+) -> ValidationReport:
+    """Validate one WGS height tile: lattice, layout, and agreement with the sampler.
+
+    A few of its valid pixels are re-sampled from the EPSG:5514 tiles under
+    ``dataset_dir``; each must be exactly the sampler's height at its centre.
+    """
+    from .raster import TAG_WGS_FILLED
+
+    report = report or ValidationReport()
+    if manifest.wgs is None:
+        report.error(f"wgs height tile {tile}: the manifest declares no WGS tiles")
+        return report
+    grid = manifest.wgs.grid()
+    label = f"wgs height tile {tile} ({path.name})"
+
+    try:
+        dataset = rasterio.open(path)
+    except Exception as exc:
+        report.error(f"wgs height tile {tile}: cannot open {path}: {exc}")
+        return report
+
+    with dataset:
+        report.tiles_checked += 1
+        tile_window = grid.height_tile_window(tile)
+        if not _check_wgs_layout(dataset, grid.height, tile_window, label, report):
+            return report
+        if dataset.count != 1 or dataset.dtypes[0] != "float32":
+            report.error(
+                f"{label}: has {dataset.count} {dataset.dtypes[0]} band(s), expected 1 float32"
+            )
+            return report
+        if dataset.nodata is None or dataset.nodata != manifest.nodata:
+            report.error(f"{label}: NoData is {dataset.nodata}, expected {manifest.nodata}")
+        filled = _filled_window(dataset, TAG_WGS_FILLED, tile_window, label, report)
+        if filled is None:
+            return report
+        col_off, row_off = filled.offset_in(tile_window)
+        heights = dataset.read(
+            1, window=rasterio.windows.Window(col_off, row_off, filled.width, filled.height)
+        ).astype(np.float64)
+
+    heights[heights == manifest.nodata] = np.nan
+    valid = np.isfinite(heights)
+    # How much of each world's box has heights is checked per world, by
+    # validate_wgs_coverage: a window shared by several worlds holds none
+    # between them.
+    if not valid.any():
+        report.error(f"{label}: holds no heights")
+        return report
+
+    rows, cols = np.nonzero(valid)
+    picks = np.unique(np.linspace(0, rows.size - 1, min(WGS_SPOT_CHECKS, rows.size)).astype(int))
+    rows, cols = rows[picks], cols[picks]
+    res = grid.height.resolution_deg
+    lons = grid.height.origin_lon + (filled.col_min + cols + 0.5) * res
+    lats = grid.height.origin_lat - (filled.row_min + rows + 0.5) * res
+    with DatasetSampler(dataset_dir, manifest) as sampler:
+        expected = sampler.sample_many(lons, lats)
+    stored = heights[rows, cols]
+    # Stored as float32, so compare at float32 precision.
+    bad = ~(np.abs(stored - expected.astype(np.float32)) <= TEST_POINT_TOLERANCE_M)
+    if bad.any():
+        i = int(np.argmax(bad))
+        report.error(
+            f"{label}: pixel at {lats[i]}, {lons[i]} holds {stored[i]!r} m, the EPSG:5514 "
+            f"tiles give {expected[i]!r} m"
+        )
+    return report
+
+
+def validate_wgs_coverage(
+    output_dir: Path, manifest: Manifest, report: ValidationReport | None = None
+) -> ValidationReport:
+    """Warn about every world whose lat/lon box is not fully covered by WGS heights."""
+    import sqlite3
+
+    report = report or ValidationReport()
+    if manifest.wgs is None or manifest.worlds_db_path is None:
+        return report
+    path = Path(output_dir) / manifest.worlds_db_path
+    if not path.is_file():
+        return report  # validate_worlds_db reports it
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        boxes = connection.execute(
+            "SELECT world, MIN(lon), MIN(lat), MAX(lon), MAX(lat) FROM safety_area_vertices "
+            "GROUP BY world ORDER BY world"
+        ).fetchall()
+    except sqlite3.Error:
+        return report  # validate_worlds_db reports it
+    finally:
+        connection.close()
+
+    grid = manifest.wgs.grid()
+    declared = set(manifest.wgs.tiles)
+    for world, *bounds in boxes:
+        fill = grid.fill_for_lonlat(tuple(bounds))
+        valid = 0
+        for tile in grid.tiles_for_window(fill):
+            tile_path = manifest.wgs_height_path(output_dir, tile)
+            if tile not in declared or not tile_path.is_file():
+                continue  # reported as missing
+            window = grid.height_tile_window(tile)
+            inside = fill.intersection(window)
+            col, row = inside.offset_in(window)
+            with rasterio.open(tile_path) as dataset:
+                heights = dataset.read(
+                    1, window=rasterio.windows.Window(col, row, inside.width, inside.height)
+                )
+            valid += int(np.count_nonzero(np.isfinite(heights) & (heights != manifest.nodata)))
+        coverage = valid / (fill.width * fill.height)
+        if coverage < WGS_MIN_COVERAGE:
+            report.warn(f"world {world}: only {coverage:.1%} of its lat/lon box has WGS heights")
+    return report
 
 
 def validate_rgb_tile(
@@ -530,16 +703,15 @@ def validate_rgb_tile(
     *,
     report: ValidationReport | None = None,
 ) -> ValidationReport:
-    """Validate one RGB tile: lattice, extent, layout, mask and imagery."""
+    """Validate one WGS RGB tile: lattice, layout, mask and imagery."""
     from .raster import TAG_RGB_FILLED
-    from .rgb import RgbWindow, projected_to_lonlat_bounds
 
     report = report or ValidationReport()
-    if manifest.rgb is None:
+    if manifest.wgs is None or manifest.wgs.rgb is None:
         report.error(f"rgb tile {tile}: the manifest declares no RGB tiles")
         return report
-    rgb_grid = manifest.rgb.grid()
-    name = path.name
+    grid = manifest.wgs.grid()
+    label = f"rgb tile {tile} ({path.name})"
 
     try:
         dataset = rasterio.open(path)
@@ -549,63 +721,27 @@ def validate_rgb_tile(
 
     with dataset:
         report.tiles_checked += 1
-        if not crs_matches(dataset.crs, 4326):
-            report.error(
-                f"rgb tile {tile} ({name}): CRS is EPSG:{epsg_code_of(dataset.crs)}, "
-                "expected EPSG:4326"
-            )
+        tile_window = grid.rgb_tile_window(tile)
+        if not _check_wgs_layout(dataset, grid.rgb, tile_window, label, report):
+            return report
         if dataset.count != 3 or any(dtype != "uint8" for dtype in dataset.dtypes):
             report.error(
-                f"rgb tile {tile} ({name}): has {dataset.count} {dataset.dtypes[0]} "
-                "band(s), expected 3 uint8"
+                f"{label}: has {dataset.count} {dataset.dtypes[0]} band(s), expected 3 uint8"
             )
         if any(rasterio.enums.MaskFlags.per_dataset not in flags for flags in dataset.mask_flag_enums):
-            report.error(f"rgb tile {tile} ({name}): has no internal per-dataset mask")
-
-        window = rgb_grid.window_of_transform(dataset.transform, dataset.width, dataset.height)
-        if window is None:
-            report.error(
-                f"rgb tile {tile} ({name}): geotransform {tuple(dataset.transform)[:6]} "
-                f"is not on the {manifest.rgb.resolution_deg} deg RGB lattice"
-            )
+            report.error(f"{label}: has no internal per-dataset mask")
+        filled = _filled_window(dataset, TAG_RGB_FILLED, tile_window, label, report)
+        if filled is None:
             return report
-
-        # The tile must cover every query its height tile answers.
-        west, south, east, north = rgb_grid.window_bounds(window)
-        need = projected_to_lonlat_bounds(manifest.grid().sampling_region(tile))
-        lat = (need[1] + need[3]) / 2
-        slack_lat = RGB_EXTENT_TOLERANCE_M / 111_320.0
-        slack_lon = slack_lat / max(math.cos(math.radians(lat)), 1e-6)
-        if (
-            west > need[0] + slack_lon
-            or east < need[2] - slack_lon
-            or south > need[1] + slack_lat
-            or north < need[3] - slack_lat
-        ):
-            report.error(
-                f"rgb tile {tile} ({name}): covers {(west, south, east, north)}, which "
-                f"does not contain its height tile's extent {need}"
-            )
-
-        filled = RgbWindow.from_tag(dataset.tags().get(TAG_RGB_FILLED))
-        if filled is None or not window.contains(filled):
-            report.error(
-                f"rgb tile {tile} ({name}): {TAG_RGB_FILLED} is "
-                f"{dataset.tags().get(TAG_RGB_FILLED)!r}, not a window inside the tile"
-            )
-            return report
-        col_off, row_off = filled.offset_in(window)
+        col_off, row_off = filled.offset_in(tile_window)
         mask = dataset.read_masks(
             1, window=rasterio.windows.Window(col_off, row_off, filled.width, filled.height)
         )
-        coverage = float(np.count_nonzero(mask)) / mask.size
-        if coverage == 0.0:
-            report.error(f"rgb tile {tile} ({name}): holds no imagery")
-        elif coverage < RGB_MIN_COVERAGE:
-            report.warn(
-                f"rgb tile {tile} ({name}): only {coverage:.1%} of the area around the "
-                "safety areas has imagery"
-            )
+    coverage = float(np.count_nonzero(mask)) / mask.size
+    if coverage == 0.0:
+        report.error(f"{label}: holds no imagery")
+    elif coverage < WGS_MIN_COVERAGE:
+        report.warn(f"{label}: only {coverage:.1%} of the area around the safety areas has imagery")
     return report
 
 
@@ -654,19 +790,22 @@ def validate_worlds_db(
                 report.error(
                     f"worlds database {path.name}: world {name} has a {count}-vertex safety area"
                 )
-        declared = set(manifest.tiles)
-        for world, ix, iy in connection.execute("SELECT world, ix, iy FROM world_tiles"):
-            if TileIndex(ix, iy) not in declared:
+        layers = [("height_tiles", "world_height_tiles", set(manifest.tiles), "")]
+        if manifest.wgs is not None:
+            layers.append(("wgs_tiles", "world_wgs_tiles", set(manifest.wgs.tiles), "WGS "))
+        for table, links, declared, kind in layers:
+            for world, ix, iy in connection.execute(f"SELECT world, ix, iy FROM {links}"):
+                if TileIndex(ix, iy) not in declared:
+                    report.error(
+                        f"worlds database {path.name}: world {world} needs {kind}tile "
+                        f"({ix}, {iy}), which the manifest does not declare"
+                    )
+            listed = {TileIndex(ix, iy) for ix, iy in connection.execute(f"SELECT ix, iy FROM {table}")}
+            if listed != declared:
                 report.error(
-                    f"worlds database {path.name}: world {world} needs tile ({ix}, {iy}), "
-                    "which the manifest does not declare"
+                    f"worlds database {path.name}: lists {len(listed)} {kind}tile(s), the "
+                    f"manifest declares {len(declared)}"
                 )
-        tiles = {TileIndex(ix, iy) for ix, iy in connection.execute("SELECT ix, iy FROM tiles")}
-        if tiles != declared:
-            report.error(
-                f"worlds database {path.name}: lists {len(tiles)} tile(s), the manifest "
-                f"declares {len(declared)}"
-            )
     except sqlite3.Error as exc:
         report.error(f"worlds database {path}: {exc}")
     finally:
@@ -728,21 +867,30 @@ def validate_dataset(
     validate_spatial_consistency(facts, manifest, report)
     validate_test_points(output_dir, manifest, report)
 
-    if manifest.rgb is not None:
-        for tile in tiles:
-            path = manifest.rgb_tile_path(output_dir, tile)
-            if not path.is_file():
-                report.tiles_missing.append(tile)
-                report.error(f"rgb tile {tile}: declared in the manifest but {path} is missing")
-                continue
+    wgs_tiles = list(manifest.wgs.tiles) if manifest.wgs is not None else []
+    for tile in wgs_tiles:
+        path = manifest.wgs_height_path(output_dir, tile)
+        if path.is_file():
+            validate_wgs_height_tile(path, manifest, tile, output_dir, report=report)
+        else:
+            report.error(f"wgs height tile {tile}: declared in the manifest but {path} is missing")
+        if manifest.wgs.rgb is None:
+            continue
+        path = manifest.wgs_rgb_path(output_dir, tile)
+        if path.is_file():
             validate_rgb_tile(path, manifest, tile, report=report)
+        else:
+            report.error(f"rgb tile {tile}: declared in the manifest but {path} is missing")
 
     validate_worlds_db(output_dir, manifest, report)
+    validate_wgs_coverage(output_dir, manifest, report)
 
     # Stray files usually mean an interrupted run or a stale manifest.
     _check_stray_files(output_dir, manifest.tile_pattern, tiles, report)
-    if manifest.rgb is not None:
-        _check_stray_files(output_dir, manifest.rgb.tile_pattern, tiles, report)
+    if manifest.wgs is not None:
+        _check_stray_files(output_dir, manifest.wgs.height_tile_pattern, wgs_tiles, report)
+        if manifest.wgs.rgb is not None:
+            _check_stray_files(output_dir, manifest.wgs.rgb.tile_pattern, wgs_tiles, report)
 
     return report
 

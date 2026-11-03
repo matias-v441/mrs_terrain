@@ -45,8 +45,9 @@ given in latlon_origin.  A world config that cannot be prepared -- unreadable,
 no latlon_origin safety area, outside the source coverage, no source data at a
 safety area corner -- is skipped with a warning.  test_points.csv in the output holds the height at every safety area
 corner, as lat,lon,height rows, for checking samplers against.  worlds.sqlite
-records each world's safety area, origin and tiles.  With --include-rgb, rgb/
-holds an orthophoto tile in EPSG:4326 for every height tile.
+records each world's safety area, origin and tiles.  wgs/height/ holds each
+world's heights in EPSG:4326, on disjoint tiles of their own; with
+--include-rgb, wgs/rgb/ holds the orthophoto on the same tiles.
 
 exit codes:
   0  success

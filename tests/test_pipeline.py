@@ -27,10 +27,22 @@ from heightmap_prep.errors import (
     ValidationError,
 )
 from heightmap_prep.manifest import STATUS_COMPLETE, Manifest
-from heightmap_prep.pipeline import merge_tile_requirements, plan_world, validate_only
-from heightmap_prep.raster import TAG_SOURCE_ID, TAG_VERTICAL_DATUM, read_tags
+from heightmap_prep.pipeline import (
+    merge_tile_requirements,
+    merge_wgs_requirements,
+    plan_world,
+    validate_only,
+)
+from heightmap_prep.raster import (
+    TAG_RGB_FILLED,
+    TAG_SOURCE_ID,
+    TAG_VERTICAL_DATUM,
+    TAG_WGS_FILLED,
+    read_tags,
+)
 from heightmap_prep.sampling import DatasetSampler, read_test_points
 from heightmap_prep.tiling import ProjectedBounds, TileGrid, TileIndex
+from heightmap_prep.wgs import LatticeWindow, WgsGrid
 
 from conftest import (
     REPO_ROOT,
@@ -45,6 +57,9 @@ TILE_PX = 128
 
 #: The grid prepare_worlds builds for these tests (phase-aligned, 256 m tiles).
 GRID = TileGrid.from_options(2.0, TILE_PX, -999_999.6, -800_000.12)
+
+#: The WGS tiling prepare_worlds builds with the default options.
+WGS = WgsGrid.from_metres(0.25)
 
 _TO_WGS84 = Transformer.from_crs("EPSG:5514", "EPSG:4326", always_xy=True)
 
@@ -219,15 +234,16 @@ def test_the_dataset_answers_a_wgs84_query(
 
 
 def test_worlds_are_planned_onto_the_global_grid(world_file: Path) -> None:
-    plan = plan_world(load_world(world_file), GRID, TEST_AREA)
+    plan = plan_world(load_world(world_file), GRID, WGS, TEST_AREA)
     assert plan.tiles
     assert set(plan.tiles) <= set(GRID.tiles_for_pixels(plan.pixels))
+    assert plan.wgs_tiles == WGS.tiles_for_window(plan.wgs_fill)
 
 
 def test_a_world_outside_coverage_is_rejected() -> None:
     atlantic = WorldConfig("atlantic", ((-30.0, 40.0), (-29.0, 40.0), (-29.0, 41.0)))
     with pytest.raises(OutOfCoverageError, match="not inside the source coverage"):
-        plan_world(atlantic, GRID, TEST_AREA)
+        plan_world(atlantic, GRID, WGS, TEST_AREA)
 
 
 def test_a_world_partly_outside_coverage_is_rejected() -> None:
@@ -237,7 +253,7 @@ def test_a_world_partly_outside_coverage_is_rejected() -> None:
         [(-743_600.0, -1_044_000.0), (-743_300.0, -1_044_000.0), (-743_300.0, -1_043_800.0)],
     )
     with pytest.raises(OutOfCoverageError, match="not inside the source coverage"):
-        plan_world(world, GRID, TEST_AREA)
+        plan_world(world, GRID, WGS, TEST_AREA)
 
 
 # A tile corner inside TEST_AREA, where the seams x = SEAM_X and y = SEAM_Y meet.
@@ -259,48 +275,95 @@ def seam_triangle(name: str, west_x: float) -> WorldConfig:
     )
 
 
-def test_the_seam_constants_are_a_tile_corner() -> None:
-    assert GRID.index_for_point(SEAM_X + 1, SEAM_Y + 1) == NE
-    assert GRID.index_for_point(SEAM_X - 1, SEAM_Y - 1) == SW
+DIAGONAL = projected_world(
+    "diagonal",
+    # A triangle over the corner whose hypotenuse passes 14 m north-east of it.
+    [(SEAM_X - 80.0, SEAM_Y + 100.0), (SEAM_X + 120.0, SEAM_Y + 100.0), (SEAM_X + 120.0, SEAM_Y - 100.0)],
+)
+
+
+def assert_fill_is_samplable(plan) -> None:
+    """Every WGS height pixel centre of the fill reads only planned pixels and tiles."""
+    lattice = WGS.height
+    fill = plan.wgs_fill
+    res = lattice.resolution_deg
+    lons = lattice.origin_lon + (np.arange(fill.col_min, fill.col_end) + 0.5) * res
+    lats = lattice.origin_lat - (np.arange(fill.row_min, fill.row_end) + 0.5) * res
+    lon, lat = np.meshgrid(lons, lats)
+    edge = np.zeros(lon.shape, dtype=bool)
+    edge[[0, -1], :] = edge[:, [0, -1]] = True
+    xs, ys = Transformer.from_crs("EPSG:4326", "EPSG:5514", always_xy=True).transform(
+        lon[edge], lat[edge]
+    )
+    cols = np.floor((xs - GRID.origin_x) / GRID.resolution_x - 0.5).astype(int)
+    rows = np.floor((GRID.origin_y - ys) / GRID.resolution_y - 0.5).astype(int)
+    pixels = plan.pixels
+    assert cols.min() >= pixels.col_min and cols.max() + 1 <= pixels.col_max
+    assert rows.min() >= pixels.row_min and rows.max() + 1 <= pixels.row_max
+    for col, row in {(c + dc, r + dr) for c, r in zip(cols, rows) for dc in (0, 1) for dr in (0, 1)}:
+        tile = TileIndex(col // GRID.tile_width_px, row // GRID.tile_height_px)
+        assert tile in plan.tiles, (col, row, tile)
+
+
+@pytest.mark.parametrize(
+    "world",
+    [seam_triangle("on", SEAM_X), seam_triangle("clear", SEAM_X + 30.0), DIAGONAL],
+    ids=lambda world: world.name,
+)
+def test_every_pixel_centre_of_the_lat_lon_box_is_samplable(world: WorldConfig) -> None:
+    assert_fill_is_samplable(plan_world(world, GRID, WGS, TEST_AREA))
+
+
+def test_the_lat_lon_box_of_a_real_world_is_samplable(world_file: Path) -> None:
+    assert_fill_is_samplable(plan_world(load_world(world_file), GRID, WGS, TEST_AREA))
+
+
+def test_the_fill_is_the_lat_lon_box_on_the_height_lattice(world_file: Path) -> None:
+    world = load_world(world_file)
+    plan = plan_world(world, GRID, WGS, TEST_AREA)
+    assert plan.wgs_fill == WGS.height.window_for_lonlat(world.bounds)
 
 
 def test_a_safety_area_touching_a_tile_edge_pulls_in_the_adjacent_tile() -> None:
-    """A vertex exactly on a seam is interpolated from pixels on both sides."""
-    assert set(plan_world(seam_triangle("on", SEAM_X), GRID, TEST_AREA).tiles) == {NW, NE}
-
-
-def test_a_safety_area_within_half_a_pixel_of_a_tile_edge_pulls_in_the_adjacent_tile() -> None:
-    plan = plan_world(seam_triangle("near", SEAM_X + 0.9), GRID, TEST_AREA)
-    assert set(plan.tiles) == {NW, NE}
+    assert set(plan_world(seam_triangle("on", SEAM_X), GRID, WGS, TEST_AREA).tiles) == {NW, NE}
 
 
 def test_a_safety_area_clear_of_a_tile_edge_stays_in_its_tile() -> None:
-    assert plan_world(seam_triangle("clear", SEAM_X + 1.2), GRID, TEST_AREA).tiles == [NE]
+    # Clear by more than its lat/lon box reaches beyond it in EPSG:5514.
+    assert plan_world(seam_triangle("clear", SEAM_X + 30.0), GRID, WGS, TEST_AREA).tiles == [NE]
 
 
-def test_a_diagonal_safety_area_skips_tiles_only_its_bounding_box_touches() -> None:
-    # A triangle over the corner whose hypotenuse passes 14 m north-east of it,
-    # so it never comes near the south-west tile.
-    world = projected_world(
-        "diagonal",
-        [
-            (SEAM_X - 80.0, SEAM_Y + 100.0),
-            (SEAM_X + 120.0, SEAM_Y + 100.0),
-            (SEAM_X + 120.0, SEAM_Y - 100.0),
-        ],
-    )
-    plan = plan_world(world, GRID, TEST_AREA)
-    assert SW in GRID.tiles_for_pixels(plan.pixels)
-    assert set(plan.tiles) == {NW, NE, SE}
+def test_a_diagonal_safety_area_pulls_in_every_tile_its_lat_lon_box_covers() -> None:
+    assert set(plan_world(DIAGONAL, GRID, WGS, TEST_AREA).tiles) == {NW, NE, SW, SE}
 
 
 def test_overlapping_worlds_share_one_fetch_per_tile(world_file: Path) -> None:
-    plan = plan_world(load_world(world_file), GRID, TEST_AREA)
+    plan = plan_world(load_world(world_file), GRID, WGS, TEST_AREA)
     required = merge_tile_requirements([plan, plan], GRID)
     assert set(required) == set(plan.tiles)
     for tile, pixels in required.items():
         # Merging the same world twice must not enlarge the area to fetch.
         assert pixels == plan.pixels.intersection(GRID.tile_pixels(tile))
+    wgs = merge_wgs_requirements([plan, plan], WGS)
+    assert set(wgs) == set(plan.wgs_tiles)
+    for tile, fill in wgs.items():
+        assert fill == plan.wgs_fill.intersection(WGS.height_tile_window(tile))
+
+
+def test_worlds_in_one_wgs_tile_share_the_window_holding_both(
+    world_file: Path, tmp_path: Path
+) -> None:
+    second_file = tmp_path / "world_second.yaml"
+    second_file.write_text(mrs_world(SECOND_WORLD_POINTS), encoding="utf-8")
+    first = plan_world(load_world(world_file), GRID, WGS, TEST_AREA)
+    second = plan_world(load_world(second_file), GRID, WGS, TEST_AREA)
+    merged = merge_wgs_requirements([first, second], WGS)
+    assert set(merged) == set(first.wgs_tiles) | set(second.wgs_tiles)
+    shared = set(first.wgs_tiles) & set(second.wgs_tiles)
+    assert shared
+    both = first.wgs_fill.union(second.wgs_fill)
+    for tile in shared:
+        assert merged[tile] == both.intersection(WGS.height_tile_window(tile))
 
 
 def test_only_the_requested_part_of_a_tile_is_fetched(
@@ -559,7 +622,7 @@ def test_the_dataset_holds_only_the_needed_tiles(
     world_file: Path, tmp_path: Path, proj_dir: Path
 ) -> None:
     result = run(world_file, tmp_path / "out", proj_dir)
-    plan = plan_world(load_world(world_file), GRID, TEST_AREA)
+    plan = plan_world(load_world(world_file), GRID, WGS, TEST_AREA)
     assert result.manifest.tiles == sorted(plan.tiles)
     assert sorted(p.name for p in (result.output_dir / "height").iterdir()) == sorted(
         f"tile_{t.ix}_{t.iy}.tif" for t in plan.tiles
@@ -654,8 +717,8 @@ LONELY_TILE = TileIndex(1005, 954)
 
 
 def test_the_lonely_world_has_a_tile_of_its_own(world_file: Path) -> None:
-    assert plan_world(LONELY, GRID, TEST_AREA).tiles == [LONELY_TILE]
-    assert LONELY_TILE not in plan_world(load_world(world_file), GRID, TEST_AREA).tiles
+    assert plan_world(LONELY, GRID, WGS, TEST_AREA).tiles == [LONELY_TILE]
+    assert LONELY_TILE not in plan_world(load_world(world_file), GRID, WGS, TEST_AREA).tiles
 
 
 def test_a_world_outside_coverage_is_skipped(
@@ -725,39 +788,124 @@ def run_rgb(world_files, out: Path, proj_dir: Path, rgb_source=None, **overrides
     )
 
 
-def test_every_height_tile_gets_a_validated_rgb_tile(
+def wgs_tile_bounds(manifest: Manifest, tile: TileIndex) -> tuple[float, ...]:
+    return manifest.wgs.grid().tile_bounds(tile)
+
+
+def test_every_wgs_tile_gets_validated_height_and_rgb_tiles(
     world_file: Path, tmp_path: Path, proj_dir: Path
 ) -> None:
     out = tmp_path / "out"
     result = run_rgb([world_file], out, proj_dir)
     assert result.report.ok, result.report.errors
-    assert {o.tile for o in result.rgb_outcomes} == set(result.manifest.tiles)
-    assert result.report.tiles_checked == 2 * len(result.manifest.tiles)
+    wgs = result.manifest.wgs
+    assert wgs.tiles
+    assert {o.tile for o in result.wgs_outcomes} == set(wgs.tiles)
+    assert {o.tile for o in result.rgb_outcomes} == set(wgs.tiles)
+    assert result.report.tiles_checked == len(result.manifest.tiles) + 2 * len(wgs.tiles)
 
     manifest = Manifest.read(out)
-    assert manifest.rgb is not None and manifest.rgb.crs == "EPSG:4326"
-    assert manifest.rgb.resolution_m == 1.0
-    for tile in manifest.tiles:
-        with rasterio.open(manifest.rgb_tile_path(out, tile)) as dataset:
-            assert dataset.crs.to_epsg() == 4326
-            assert (dataset.count, dataset.dtypes[0]) == (3, "uint8")
-            assert manifest.rgb.grid().window_of_transform(
-                dataset.transform, dataset.width, dataset.height
-            ) == manifest.rgb.grid().tile_window(manifest.grid(), tile)
+    grid = manifest.wgs.grid()
+    assert manifest.wgs.crs == "EPSG:4326" and manifest.wgs.resolution_m == 1.0
+    for tile in manifest.wgs.tiles:
+        with rasterio.open(manifest.wgs_height_path(out, tile)) as heights:
+            assert heights.crs.to_epsg() == 4326
+            assert (heights.count, heights.dtypes[0]) == (1, "float32")
+            assert grid.height.window_of_transform(
+                heights.transform, heights.width, heights.height
+            ) == grid.height_tile_window(tile)
+        with rasterio.open(manifest.wgs_rgb_path(out, tile)) as rgb:
+            assert (rgb.count, rgb.dtypes[0]) == (3, "uint8")
+            assert grid.rgb.window_of_transform(
+                rgb.transform, rgb.width, rgb.height
+            ) == grid.rgb_tile_window(tile)
+            assert tuple(rgb.bounds) == pytest.approx(tuple(heights.bounds), abs=1e-12)
     assert validate_only(out).ok
+
+
+def test_wgs_tiles_do_not_overlap(world_file: Path, tmp_path: Path, proj_dir: Path) -> None:
+    second = tmp_path / "world_second.yaml"
+    second.write_text(mrs_world(SECOND_WORLD_POINTS), encoding="utf-8")
+    # Tiles small enough that the two worlds spread over several.
+    result = run_rgb([world_file, second], tmp_path / "out", proj_dir, wgs_tile_size_px=256)
+    tiles = result.manifest.wgs.tiles
+    assert len(tiles) > 4
+    boxes = [wgs_tile_bounds(result.manifest, tile) for tile in tiles]
+    for i, (w0, s0, e0, n0) in enumerate(boxes):
+        for w1, s1, e1, n1 in boxes[i + 1 :]:
+            assert min(e0, e1) <= max(w0, w1) + 1e-12 or min(n0, n1) <= max(s0, s1) + 1e-12
+
+
+def test_wgs_heights_are_the_sampler_at_their_pixel_centres(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    out = tmp_path / "out"
+    # Tiles small enough that the world spreads over several.
+    result = run(world_file, out, proj_dir, wgs_tile_size_px=2048)
+    manifest = result.manifest
+    grid = manifest.wgs.grid()
+    assert len(manifest.wgs.tiles) > 1
+    fill = grid.fill_for_lonlat(load_world(world_file).bounds)
+    seen = 0
+    with DatasetSampler(out, manifest) as sampler:
+        for tile in manifest.wgs.tiles:
+            with rasterio.open(manifest.wgs_height_path(out, tile)) as dataset:
+                stored = dataset.read(1).astype(np.float64)
+                window = grid.height_tile_window(tile)
+            inside = fill.intersection(window)
+            col, row = inside.offset_in(window)
+            block = stored[row : row + inside.height, col : col + inside.width]
+            res = grid.height.resolution_deg
+            lons = grid.height.origin_lon + (np.arange(inside.col_min, inside.col_end) + 0.5) * res
+            lats = grid.height.origin_lat - (np.arange(inside.row_min, inside.row_end) + 0.5) * res
+            expected = sampler.sample_many(lons[np.newaxis, :], lats[:, np.newaxis])
+            # The whole lat/lon box has heights, and they are the sampler's.
+            assert np.isfinite(expected).all()
+            np.testing.assert_array_equal(block, expected.astype(np.float32))
+            # Nothing outside the box.
+            outside = np.ones(stored.shape, dtype=bool)
+            outside[row : row + inside.height, col : col + inside.width] = False
+            assert (stored[outside] == manifest.nodata).all()
+            seen += inside.width * inside.height
+    assert seen == fill.width * fill.height
+
+
+def test_worlds_sharing_a_wgs_tile_are_both_fully_covered(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    second = tmp_path / "world_second.yaml"
+    second.write_text(mrs_world(SECOND_WORLD_POINTS), encoding="utf-8")
+    result = prepare_worlds(
+        [world_file, second], tmp_path / "out", options(proj_dir), source=SyntheticSource()
+    )
+    assert result.report.ok, result.report.errors
+    assert not any("WGS heights" in warning for warning in result.report.warnings)
+
+
+def test_a_hole_inside_a_lat_lon_box_is_warned_about(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    # Inside the safety area, away from its corners.
+    hole = ProjectedBounds(-743_100.0, -1_043_950.0, -742_950.0, -1_043_850.0)
+    result = run(world_file, tmp_path / "out", proj_dir, source=SyntheticSource(nodata_region=hole))
+    assert result.report.ok, result.report.errors
+    assert any(
+        "world testworld" in warning and "has WGS heights" in warning
+        for warning in result.report.warnings
+    )
 
 
 def test_rgb_imagery_covers_the_whole_safety_area(
     world_file: Path, tmp_path: Path, proj_dir: Path
 ) -> None:
     out = tmp_path / "out"
-    run_rgb([world_file], out, proj_dir)
+    run_rgb([world_file], out, proj_dir, wgs_tile_size_px=256)
     manifest = Manifest.read(out)
+    grid = manifest.wgs.grid()
     world = load_world(world_file)
     for lon, lat in polygon_samples(world):
-        x, y = Transformer.from_crs("EPSG:4326", "EPSG:5514", always_xy=True).transform(lon, lat)
-        tile = manifest.grid().index_for_point(x, y)
-        with rasterio.open(manifest.rgb_tile_path(out, tile)) as dataset:
+        tile = grid.tile_index(lon, lat)
+        with rasterio.open(manifest.wgs_rgb_path(out, tile)) as dataset:
             row, col = dataset.index(lon, lat)
             window = rasterio.windows.Window(col, row, 1, 1)
             assert dataset.read_masks(1, window=window)[0, 0] == 255
@@ -785,20 +933,59 @@ def test_a_new_world_in_an_rgb_tile_needs_overwrite(
     run_rgb([world_file], out, proj_dir)
     second = tmp_path / "world_second.yaml"
     second.write_text(mrs_world(SECOND_WORLD_POINTS), encoding="utf-8")
-    with pytest.raises(OutputConflictError, match="less than the worlds now need"):
+    # A new world is new to the height tiles too, so they need replacing first.
+    with pytest.raises(OutputConflictError, match="heights for less"):
+        run_rgb([world_file, second], out, proj_dir)
+    prepare_worlds(
+        [world_file, second],
+        out,
+        options(proj_dir, overwrite=True, rgb_resolution_m=1.0),
+        source=SyntheticSource(),
+    )
+    with pytest.raises(OutputConflictError, match="imagery for less than the worlds now need"):
         run_rgb([world_file, second], out, proj_dir)
     result = run_rgb([world_file, second], out, proj_dir, overwrite=True)
     assert result.report.ok, result.report.errors
     assert {o.action for o in result.rgb_outcomes} == {"written"}
 
 
-def test_a_different_rgb_resolution_without_overwrite_is_refused(
+def test_a_different_jpeg_quality_without_overwrite_is_refused(
     world_file: Path, tmp_path: Path, proj_dir: Path
 ) -> None:
     out = tmp_path / "out"
     run_rgb([world_file], out, proj_dir)
-    with pytest.raises(OutputConflictError, match="RGB_RESOLUTION"):
+    with pytest.raises(OutputConflictError, match="RGB_JPEG_QUALITY"):
+        run_rgb([world_file], out, proj_dir, rgb_jpeg_quality=50)
+
+
+def test_a_different_rgb_resolution_cuts_other_tiles(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    out = tmp_path / "out"
+    first = run_rgb([world_file], out, proj_dir).manifest.wgs.tiles
+    # The coarser WGS lattice snaps the lat/lon box differently, so the
+    # EPSG:5514 tiles need other pixels too.
+    with pytest.raises(OutputConflictError, match="heights for less"):
         run_rgb([world_file], out, proj_dir, rgb_resolution_m=2.0)
+    second = run_rgb([world_file], out, proj_dir, rgb_resolution_m=2.0, overwrite=True)
+    assert not set(first) & set(second.manifest.wgs.tiles)
+    # The first run's tiles are left behind, and reported.
+    assert validate_only(out).unexpected_files
+
+
+def test_a_new_world_in_a_height_tile_needs_overwrite(
+    world_file: Path, tmp_path: Path, proj_dir: Path
+) -> None:
+    out = tmp_path / "out"
+    run(world_file, out, proj_dir)
+    second = tmp_path / "world_second.yaml"
+    second.write_text(mrs_world(SECOND_WORLD_POINTS), encoding="utf-8")
+    worlds = [world_file, second]
+    with pytest.raises(OutputConflictError, match="heights for less than the worlds now need"):
+        prepare_worlds(worlds, out, options(proj_dir), source=SyntheticSource())
+    result = prepare_worlds(worlds, out, options(proj_dir, overwrite=True), source=SyntheticSource())
+    assert result.report.ok, result.report.errors
+    assert sorted(result.manifest.worlds) == ["second", "testworld"]
 
 
 def test_a_missing_rgb_tile_fails_validation(
@@ -806,12 +993,12 @@ def test_a_missing_rgb_tile_fails_validation(
 ) -> None:
     out = tmp_path / "out"
     result = run_rgb([world_file], out, proj_dir)
-    result.manifest.rgb_tile_path(out, result.manifest.tiles[0]).unlink()
+    result.manifest.wgs_rgb_path(out, result.manifest.wgs.tiles[0]).unlink()
     report = validate_only(out)
     assert not report.ok and any("rgb tile" in e for e in report.errors)
 
 
-def test_rgb_tiles_only_skipped_worlds_needed_are_removed(
+def test_wgs_tiles_hold_only_the_worlds_kept(
     world_file: Path, tmp_path: Path, proj_dir: Path
 ) -> None:
     lonely = write_world(tmp_path / "world_lonely.yaml", LONELY)
@@ -825,8 +1012,16 @@ def test_rgb_tiles_only_skipped_worlds_needed_are_removed(
         rgb_source=SyntheticRgbSource(),
     )
     assert result.report.ok, result.report.errors
-    assert all(o.tile != LONELY_TILE for o in result.rgb_outcomes)
-    assert not (out / "rgb" / f"tile_{LONELY_TILE.ix}_{LONELY_TILE.iy}.tif").exists()
+    manifest = result.manifest
+    grid = manifest.wgs.grid()
+    plan = plan_world(load_world(world_file), GRID, grid, TEST_AREA)
+    assert manifest.wgs.tiles == sorted(plan.wgs_tiles)
+    for tile in manifest.wgs.tiles:
+        fill = plan.wgs_fill.intersection(grid.height_tile_window(tile))
+        heights = read_tags(manifest.wgs_height_path(out, tile))[TAG_WGS_FILLED]
+        rgb = read_tags(manifest.wgs_rgb_path(out, tile))[TAG_RGB_FILLED]
+        assert LatticeWindow.from_tag(heights) == fill
+        assert LatticeWindow.from_tag(rgb) == fill.scaled(grid.height_factor)
     assert not validate_only(out).unexpected_files
 
 
@@ -861,7 +1056,8 @@ def test_the_worlds_database_is_written_without_rgb(
 ) -> None:
     out = tmp_path / "out"
     result = run(world_file, out, proj_dir)
-    assert result.manifest.rgb is None
+    assert result.manifest.wgs is not None and result.manifest.wgs.rgb is None
     assert result.manifest.worlds_db_path == "worlds.sqlite"
     assert (out / "worlds.sqlite").is_file()
-    assert not (out / "rgb").exists()
+    assert (out / "wgs" / "height").is_dir()
+    assert not (out / "wgs" / "rgb").exists()

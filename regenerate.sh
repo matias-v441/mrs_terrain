@@ -5,8 +5,8 @@
 #   ./regenerate.sh                 # extra arguments go to heightmap-prep,
 #   ./regenerate.sh --workers 4     # e.g. --workers or --log-level debug
 #
-# The dataset includes the ČÚZK orthophoto (rgb/) and the worlds database
-# (worlds.sqlite).  The first run creates .venv and downloads the PROJ grids.
+# The dataset includes WGS tiles of heights and the ČÚZK orthophoto (wgs/) and
+# the worlds database (worlds.sqlite).  The first run creates .venv and downloads the PROJ grids.
 # Downloaded source rasters and imagery are cached in cache/, so regenerating
 # after a small change is quick.
 set -euo pipefail

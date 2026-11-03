@@ -2,8 +2,9 @@
 
 ``worlds.sqlite`` sits next to ``dataset.yaml``.  It records, for every world
 the dataset was prepared for, the safety area, the world origin and the vertical
-limits from its MRS world file, and links the world to the tiles it needs, with
-the height and RGB tile files and the extent of each RGB tile.  It is rebuilt
+limits from its MRS world file, and links the world to the tiles it needs: the
+EPSG:5514 height tiles a sampler reads, and the EPSG:4326 WGS tiles, with the
+files and extent of each.  It is rebuilt
 from scratch on every run, so it always describes exactly the dataset beside it.
 
 Schema (``PRAGMA user_version`` is :data:`SCHEMA_VERSION`)::
@@ -13,13 +14,15 @@ Schema (``PRAGMA user_version`` is :data:`SCHEMA_VERSION`)::
            origin_lat, origin_lon, safety_area_frame, vertical_frame, min_z, max_z,
            safety_area_wkt)
     safety_area_vertices(world, seq, lat, lon)        -- in file order
-    tiles(ix, iy, height_path, rgb_path, rgb_west, rgb_south, rgb_east, rgb_north)
-    world_tiles(world, ix, iy)
+    height_tiles(ix, iy, path)                        -- EPSG:5514 tile indices
+    world_height_tiles(world, ix, iy)
+    wgs_tiles(ix, iy, west, south, east, north, height_path, rgb_path)
+    world_wgs_tiles(world, ix, iy)                    -- WGS tile indices
 
 Coordinates are WGS84 degrees.  ``origin_x``/``origin_y`` are the world file's
 values verbatim; ``origin_lat``/``origin_lon`` are the same point in degrees, or
-NULL when the world file gives no usable origin.  The ``rgb_*`` columns are NULL
-when the dataset has no RGB tiles.
+NULL when the world file gives no usable origin.  The two kinds of tile are
+indexed independently.  ``rgb_path`` is NULL when the dataset has no RGB tiles.
 """
 
 from __future__ import annotations
@@ -42,7 +45,7 @@ log = logging.getLogger(__name__)
 WORLDS_DB_FILENAME = "worlds.sqlite"
 
 #: Bumped whenever the schema changes incompatibly.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE meta (
@@ -70,23 +73,36 @@ CREATE TABLE safety_area_vertices (
     lon   REAL    NOT NULL,
     PRIMARY KEY (world, seq)
 );
-CREATE TABLE tiles (
-    ix          INTEGER NOT NULL,
-    iy          INTEGER NOT NULL,
-    height_path TEXT    NOT NULL,
-    rgb_path    TEXT,
-    rgb_west    REAL,
-    rgb_south   REAL,
-    rgb_east    REAL,
-    rgb_north   REAL,
+CREATE TABLE height_tiles (
+    ix   INTEGER NOT NULL,
+    iy   INTEGER NOT NULL,
+    path TEXT    NOT NULL,
     PRIMARY KEY (ix, iy)
 );
-CREATE TABLE world_tiles (
+CREATE TABLE world_height_tiles (
     world TEXT    NOT NULL REFERENCES worlds(name),
     ix    INTEGER NOT NULL,
     iy    INTEGER NOT NULL,
     PRIMARY KEY (world, ix, iy),
-    FOREIGN KEY (ix, iy) REFERENCES tiles(ix, iy)
+    FOREIGN KEY (ix, iy) REFERENCES height_tiles(ix, iy)
+);
+CREATE TABLE wgs_tiles (
+    ix          INTEGER NOT NULL,
+    iy          INTEGER NOT NULL,
+    west        REAL    NOT NULL,
+    south       REAL    NOT NULL,
+    east        REAL    NOT NULL,
+    north       REAL    NOT NULL,
+    height_path TEXT    NOT NULL,
+    rgb_path    TEXT,
+    PRIMARY KEY (ix, iy)
+);
+CREATE TABLE world_wgs_tiles (
+    world TEXT    NOT NULL REFERENCES worlds(name),
+    ix    INTEGER NOT NULL,
+    iy    INTEGER NOT NULL,
+    PRIMARY KEY (world, ix, iy),
+    FOREIGN KEY (ix, iy) REFERENCES wgs_tiles(ix, iy)
 );
 """
 
@@ -125,20 +141,19 @@ def write_worlds_db(
     manifest: Manifest,
     worlds: Sequence[WorldConfig],
     world_tiles: Mapping[str, Sequence[TileIndex]],
-    rgb_bounds: Mapping[TileIndex, tuple[float, float, float, float]] | None = None,
+    world_wgs_tiles: Mapping[str, Sequence[TileIndex]] | None = None,
 ) -> Path:
     """Build ``worlds.sqlite`` in ``output_dir`` and record it in ``manifest``.
 
-    ``world_tiles`` maps each world's name to the tiles it needs; ``rgb_bounds``
-    gives each RGB tile's ``(west, south, east, north)`` when there are RGB tiles.
-    The database is built beside its final name and renamed into place, so a
-    reader never sees it half-written.
+    ``world_tiles`` and ``world_wgs_tiles`` map each world's name to the
+    EPSG:5514 and the WGS tiles it needs.  The database is built beside its
+    final name and renamed into place, so a reader never sees it half-written.
     """
     output_dir = Path(output_dir)
     path = output_dir / WORLDS_DB_FILENAME
     tmp = path.with_name(path.name + ".tmp")
     tmp.unlink(missing_ok=True)
-    rgb_bounds = rgb_bounds or {}
+    world_wgs_tiles = world_wgs_tiles or {}
 
     meta = {
         "schema_version": str(SCHEMA_VERSION),
@@ -146,9 +161,13 @@ def write_worlds_db(
         "height_tile_pattern": manifest.tile_pattern,
         "height_horizontal_crs": manifest.horizontal_crs,
     }
-    if manifest.rgb is not None:
-        meta["rgb_tile_pattern"] = manifest.rgb.tile_pattern
-        meta["rgb_crs"] = manifest.rgb.crs
+    wgs = manifest.wgs
+    if wgs is not None:
+        meta["wgs_crs"] = wgs.crs
+        meta["wgs_tile_span_deg"] = repr(wgs.grid().tile_span_deg)
+        meta["wgs_height_tile_pattern"] = wgs.height_tile_pattern
+        if wgs.rgb is not None:
+            meta["wgs_rgb_tile_pattern"] = wgs.rgb.tile_pattern
 
     try:
         connection = sqlite3.connect(tmp)
@@ -158,21 +177,24 @@ def write_worlds_db(
             connection.executemany(
                 "INSERT INTO meta VALUES (?, ?)", sorted(meta.items())
             )
-            for tile in manifest.tiles:
-                bounds = rgb_bounds.get(tile)
-                connection.execute(
-                    "INSERT INTO tiles VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        tile.ix,
-                        tile.iy,
-                        manifest.tile_relative_path(tile),
+            connection.executemany(
+                "INSERT INTO height_tiles VALUES (?, ?, ?)",
+                [(t.ix, t.iy, manifest.tile_relative_path(t)) for t in manifest.tiles],
+            )
+            if wgs is not None:
+                grid = wgs.grid()
+                connection.executemany(
+                    "INSERT INTO wgs_tiles VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
                         (
-                            manifest.rgb.tile_pattern.format(ix=tile.ix, iy=tile.iy)
-                            if manifest.rgb is not None
-                            else None
-                        ),
-                        *(bounds if bounds is not None else (None, None, None, None)),
-                    ),
+                            t.ix,
+                            t.iy,
+                            *grid.tile_bounds(t),
+                            wgs.height_tile_pattern.format(ix=t.ix, iy=t.iy),
+                            wgs.rgb.tile_pattern.format(ix=t.ix, iy=t.iy) if wgs.rgb else None,
+                        )
+                        for t in wgs.tiles
+                    ],
                 )
             for world in sorted(worlds, key=lambda w: w.name):
                 origin = world.origin
@@ -198,10 +220,14 @@ def write_worlds_db(
                     "INSERT INTO safety_area_vertices VALUES (?, ?, ?, ?)",
                     [(world.name, seq, lat, lon) for seq, (lon, lat) in enumerate(world.points)],
                 )
-                connection.executemany(
-                    "INSERT INTO world_tiles VALUES (?, ?, ?)",
-                    [(world.name, t.ix, t.iy) for t in sorted(set(world_tiles.get(world.name, ())))],
-                )
+                for table, links in (
+                    ("world_height_tiles", world_tiles),
+                    ("world_wgs_tiles", world_wgs_tiles),
+                ):
+                    connection.executemany(
+                        f"INSERT INTO {table} VALUES (?, ?, ?)",
+                        [(world.name, t.ix, t.iy) for t in sorted(set(links.get(world.name, ())))],
+                    )
             connection.commit()
         finally:
             connection.close()
