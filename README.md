@@ -433,6 +433,46 @@ coordinate. It also ships a node exposing the sampler over a service. See
 [its README](src/heightmap_sampler/README.md) for how to point it at a dataset
 and how its results are checked against `examples/sampler.py`.
 
+### Region grids against point samples
+
+The package also returns whole regions: `height_grid` stitches the
+[WGS height tiles](#wgs-tiles) over a lat/lon rectangle. The two approaches
+convert coordinates differently:
+
+* `sample` transforms each query into EPSG:5514 and interpolates the 2 m
+  tiles there.
+* A grid is interpolated in EPSG:4326, on pixels that were themselves sampled
+  from the EPSG:5514 tiles at each pixel centre. Those pixels are about
+  2.0 × 1.3 m.
+
+Interpolating twice makes the grid slightly smoother than `sample`. To measure
+how much, each world got one `height_grid` over its safety area's lat/lon
+bounding box. At 2000 random points per world, uniform in that box (seed 1),
+the grid's bilinear interpolation was compared against `sample`. Δ is grid
+minus `sample`, in metres, over the points where both have a height:
+
+| world | points | both | only `sample` | only grid | mean \|Δ\| | RMS | p95 | p99 | max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| bechovice | 2000 | 1982 | 18 | 0 | 0.005 | 0.009 | 0.020 | 0.039 | 0.069 |
+| brandysek | 2000 | 1992 | 8 | 0 | 0.004 | 0.007 | 0.013 | 0.029 | 0.097 |
+| kn_yard | 2000 | 1995 | 5 | 0 | 0.002 | 0.005 | 0.010 | 0.024 | 0.043 |
+| ricany | 2000 | 1992 | 8 | 0 | 0.006 | 0.016 | 0.020 | 0.063 | 0.292 |
+| temesvar_field | 2000 | 2000 | 0 | 0 | 0.004 | 0.007 | 0.016 | 0.027 | 0.068 |
+| temesvar_field_1 | 2000 | 1993 | 7 | 0 | 0.004 | 0.007 | 0.016 | 0.028 | 0.056 |
+| temesvar_field_12 | 2000 | 1999 | 1 | 0 | 0.004 | 0.007 | 0.014 | 0.026 | 0.074 |
+| temesvar_field_123 | 2000 | 1996 | 4 | 0 | 0.004 | 0.007 | 0.015 | 0.030 | 0.065 |
+| temesvar_field_2 | 2000 | 2000 | 0 | 0 | 0.004 | 0.007 | 0.014 | 0.027 | 0.066 |
+| temesvar_field_23 | 2000 | 2000 | 0 | 0 | 0.004 | 0.006 | 0.014 | 0.023 | 0.051 |
+| temesvar_field_3 | 2000 | 2000 | 0 | 0 | 0.005 | 0.008 | 0.016 | 0.028 | 0.094 |
+| temesvar_river | 2000 | 1996 | 4 | 0 | 0.007 | 0.027 | 0.040 | 0.103 | 0.631 |
+| **all** | 24000 | 23945 | 55 | 0 | 0.004 | 0.011 | 0.016 | 0.037 | 0.631 |
+
+Typical differences are millimetres. The largest come where the terrain bends
+sharply within a pixel, which smoothing affects most. Every "only `sample`"
+point lies within half a grid pixel of the box edge. There, interpolation needs
+a pixel just outside the box, and the WGS tiles leave that pixel NoData. So a
+grid covering a whole bounding box has NaN along its outer edge.
+
 ## Resume and atomicity
 
 Preparation is restartable. Each tile is written to `tile_<ix>_<iy>.tif.tmp`,

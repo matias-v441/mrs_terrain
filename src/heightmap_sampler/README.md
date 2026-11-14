@@ -67,7 +67,9 @@ these tiles at all.
 
 The EPSG:4326 heights are themselves bilinear samples of the EPSG:5514 tiles,
 taken at each pixel centre. So interpolating a grid gives a close
-approximation of `sample`, not the same value.
+approximation of `sample`, not the same value. On the bundled dataset the
+difference is a few millimetres typically and 0.63 m at worst; see
+[the comparison](../../README.md#region-grids-against-point-samples).
 `info()` reports what the manifest says the returned values are, so a consumer
 can assert the vertical datum it expects rather than assuming one.
 
