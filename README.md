@@ -26,6 +26,11 @@ From C++, link `heightmap_sampler::heightmap_sampler` and:
 ```cpp
 heightmap_sampler::HeightSampler sampler;                      // finds the bundled dataset
 std::optional<double> h = sampler.sample(50.0905258, 14.6327381);  // lat, lon
+
+// Heights and imagery over a lat/lon rectangle (north-west, south-east corner).
+heightmap_sampler::Roi roi{{50.0906, 14.6326}, {50.0900, 14.6335}};
+std::optional<heightmap_sampler::HeightGrid> heights = sampler.height_grid(roi);
+std::optional<heightmap_sampler::RgbGrid> image = sampler.rgb_grid(roi);
 ```
 
 Heights are WGS84 ellipsoidal metres, the datum `regenerate.sh` prepares. A

@@ -39,6 +39,47 @@ void replace_all(std::string & text, const std::string & needle, const std::stri
   }
 }
 
+WgsLayer read_wgs_layer(const YAML::Node & node, const std::string & path)
+{
+  WgsLayer layer;
+  layer.resolution_deg = require_as<double>(node, "resolution_deg", path + ".resolution_deg");
+  layer.tile_width_px = require_as<std::int64_t>(node, "tile_width_px", path + ".tile_width_px");
+  layer.tile_height_px =
+    require_as<std::int64_t>(node, "tile_height_px", path + ".tile_height_px");
+  layer.tile_pattern = require_as<std::string>(node, "tile_pattern", path + ".tile_pattern");
+
+  if (!(layer.resolution_deg > 0.0)) {
+    throw DatasetError(path + ".resolution_deg must be positive");
+  }
+  if (layer.tile_width_px <= 0 || layer.tile_height_px <= 0) {
+    throw DatasetError(path + " tile dimensions must be positive");
+  }
+  (void)render_tile_path(layer.tile_pattern, TileIndex{0, 0});
+  return layer;
+}
+
+WgsManifest read_wgs(const YAML::Node & wgs)
+{
+  const auto crs = require_as<std::string>(wgs, "crs", "wgs.crs");
+  if (crs != kWgsCrs) {
+    throw DatasetError(
+            "wgs.crs is '" + crs + "', this sampler only handles '" + std::string(kWgsCrs) + "'");
+  }
+
+  WgsManifest manifest;
+  manifest.origin_lon = require_as<double>(wgs, "lattice_origin_lon", "wgs.lattice_origin_lon");
+  manifest.origin_lat = require_as<double>(wgs, "lattice_origin_lat", "wgs.lattice_origin_lat");
+
+  const YAML::Node height = require(wgs, "height", "wgs.height");
+  manifest.height = read_wgs_layer(height, "wgs.height");
+  manifest.height_nodata = require_as<double>(height, "nodata", "wgs.height.nodata");
+
+  if (const YAML::Node rgb = wgs["rgb"]; rgb && !rgb.IsNull()) {
+    manifest.rgb = read_wgs_layer(rgb, "wgs.rgb");
+  }
+  return manifest;
+}
+
 }  // namespace
 
 std::string render_tile_path(const std::string & pattern, TileIndex tile)
@@ -129,6 +170,10 @@ Manifest load_manifest(const std::filesystem::path & dataset_dir)
     require_as<std::string>(storage, "tile_pattern", "storage.tile_pattern");
   // Fail now rather than on the first sample if the pattern is unusable.
   (void)render_tile_path(manifest.tile_pattern, TileIndex{0, 0});
+
+  if (const YAML::Node wgs = root["wgs"]; wgs && !wgs.IsNull()) {
+    manifest.wgs = read_wgs(wgs);
+  }
 
   return manifest;
 }

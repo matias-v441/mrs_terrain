@@ -1,0 +1,30 @@
+# Read the prepared heights over a region of interest, stitched from the
+# dataset's EPSG:4326 height tiles.
+#
+# The region is an axis-aligned WGS84 rectangle: min_pt is its south-west
+# corner and max_pt its north-east corner.  Altitudes are ignored.
+geographic_msgs/BoundingBox roi
+---
+# False when the region is invalid (inverted, or off the globe), or when a tile
+# it needs is absent from the dataset; message then says why.  Pixels without
+# a height do not make a request fail: they are NaN in the grid.
+bool success
+string message
+
+# Where the grid lies, in EPSG:4326 degrees: the west and north edges of the
+# whole grid (the outer corner of pixel (0, 0)), and the size of a pixel along
+# both axes.  Each pixel's value belongs to its centre.
+float64 west
+float64 north
+float64 resolution_deg
+
+# Row 0 is northmost, columns run east; encoding 32FC1.
+#
+# The grid holds exactly the pixels that bilinear interpolation between pixel
+# centres reads for some point of the region, so every point of it, the corners
+# included, can be interpolated from the grid alone.
+#
+# Heights are in the dataset's stored vertical datum (WGS84 ellipsoidal metres
+# for the bundled dataset), already converted offline; NaN where there is no
+# prepared height.
+sensor_msgs/Image grid

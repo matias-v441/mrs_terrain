@@ -16,6 +16,7 @@ find_package(geographic_msgs REQUIRED)
 find_package(heightmap_sampler_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(GDAL REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
@@ -49,6 +50,7 @@ target_link_libraries(sampler_node_component
     rclcpp::rclcpp
     ${geographic_msgs_TARGETS}
     ${heightmap_sampler_msgs_TARGETS}
+    ${sensor_msgs_TARGETS}
   PRIVATE
     rclcpp_components::component
 )
@@ -151,6 +153,9 @@ if(BUILD_TESTING)
   target_include_directories(test_tile_grid PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test_tile_grid heightmap_sampler)
 
+  ament_add_gtest(test_wgs_lattice test/test_wgs_lattice.cpp)
+  target_include_directories(test_wgs_lattice PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
   ament_add_gtest(test_manifest test/test_manifest.cpp)
   target_include_directories(test_manifest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test_manifest heightmap_sampler)
@@ -159,6 +164,11 @@ if(BUILD_TESTING)
   target_include_directories(test_height_sampler PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test_height_sampler heightmap_sampler)
   target_compile_definitions(test_height_sampler
+    PRIVATE HEIGHTMAP_SAMPLER_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/test/data")
+
+  ament_add_gtest(test_roi test/test_roi.cpp)
+  target_link_libraries(test_roi heightmap_sampler)
+  target_compile_definitions(test_roi
     PRIVATE HEIGHTMAP_SAMPLER_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/test/data")
 
   # Reproduces the reference heights heightmap-prep shipped with the bundled

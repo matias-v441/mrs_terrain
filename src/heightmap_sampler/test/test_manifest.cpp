@@ -38,6 +38,35 @@ storage:
   tile_pattern: height/tile_{ix}_{iy}.tif
 )";
 
+/// A wgs/ section, as heightmap-prep writes it, minus its provenance.
+const char * kWgsSection =
+  R"(wgs:
+  crs: EPSG:4326
+  lattice_origin_lon: -180.0
+  lattice_origin_lat: 90.0
+  height:
+    resolution_deg: 1.796622349982034e-05
+    tile_width_px: 1024
+    tile_height_px: 1024
+    tile_pattern: wgs/height/tile_{ix}_{iy}.tif
+    nodata: -9999.0
+  rgb:
+    resolution_deg: 2.2457779374775424e-06
+    tile_width_px: 8192
+    tile_height_px: 8192
+    tile_pattern: wgs/rgb/tile_{ix}_{iy}.tif
+)";
+
+/// The valid manifest with a wgs/ section, with one line replaced.
+std::string wgs_manifest_with(const std::string & from, const std::string & to)
+{
+  std::string text = std::string(kValidManifest) + kWgsSection;
+  const std::size_t at = text.find(from);
+  EXPECT_NE(at, std::string::npos) << "test needs to patch '" << from << "'";
+  text.replace(at, from.size(), to);
+  return text;
+}
+
 /// A dataset directory holding nothing but a manifest, cleaned up on scope exit.
 class TempDataset
 {
@@ -142,4 +171,55 @@ TEST(Manifest, RejectsAMissingManifest) {
   EXPECT_THROW(
     load_manifest(std::filesystem::temp_directory_path() / "heightmap_sampler_no_such_dir"),
     DatasetError);
+}
+
+TEST(Manifest, AManifestWithoutWgsTilesHasNone) {
+  const TempDataset dataset{kValidManifest};
+  EXPECT_FALSE(load_manifest(dataset.path()).wgs.has_value());
+}
+
+TEST(Manifest, ReadsTheWgsTiles) {
+  const TempDataset dataset{std::string(kValidManifest) + kWgsSection};
+  const auto manifest = load_manifest(dataset.path());
+  ASSERT_TRUE(manifest.wgs.has_value());
+  const auto & wgs = *manifest.wgs;
+
+  EXPECT_DOUBLE_EQ(wgs.origin_lon, -180.0);
+  EXPECT_DOUBLE_EQ(wgs.origin_lat, 90.0);
+  EXPECT_DOUBLE_EQ(wgs.height.resolution_deg, 1.796622349982034e-05);
+  EXPECT_EQ(wgs.height.tile_width_px, 1024);
+  EXPECT_EQ(wgs.height.tile_height_px, 1024);
+  EXPECT_EQ(wgs.height.tile_pattern, "wgs/height/tile_{ix}_{iy}.tif");
+  EXPECT_DOUBLE_EQ(wgs.height_nodata, -9999.0);
+
+  ASSERT_TRUE(wgs.rgb.has_value());
+  EXPECT_DOUBLE_EQ(wgs.rgb->resolution_deg, 2.2457779374775424e-06);
+  EXPECT_EQ(wgs.rgb->tile_width_px, 8192);
+  EXPECT_EQ(wgs.rgb->tile_pattern, "wgs/rgb/tile_{ix}_{iy}.tif");
+}
+
+TEST(Manifest, WgsTilesWithoutImageryHaveNoRgbLayer) {
+  std::string text = std::string(kValidManifest) + kWgsSection;
+  text.erase(text.find("  rgb:\n"));
+  const TempDataset dataset{text};
+  const auto manifest = load_manifest(dataset.path());
+  ASSERT_TRUE(manifest.wgs.has_value());
+  EXPECT_FALSE(manifest.wgs->rgb.has_value());
+}
+
+TEST(Manifest, RejectsWgsTilesInAnotherCrs) {
+  const TempDataset dataset{wgs_manifest_with("crs: EPSG:4326", "crs: EPSG:3857")};
+  EXPECT_THROW(load_manifest(dataset.path()), DatasetError);
+}
+
+TEST(Manifest, RejectsAMissingWgsKey) {
+  const TempDataset dataset{
+    wgs_manifest_with("    tile_pattern: wgs/height/tile_{ix}_{iy}.tif\n", "")};
+  EXPECT_THROW(load_manifest(dataset.path()), DatasetError);
+}
+
+TEST(Manifest, RejectsANonPositiveWgsResolution) {
+  const TempDataset dataset{
+    wgs_manifest_with("resolution_deg: 1.796622349982034e-05", "resolution_deg: 0.0")};
+  EXPECT_THROW(load_manifest(dataset.path()), DatasetError);
 }

@@ -19,6 +19,7 @@
   <depend>libgdal-dev</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_components</depend>
+  <depend>sensor_msgs</depend>
   <depend>yaml-cpp</depend>
 
   <exec_depend>launch</exec_depend>

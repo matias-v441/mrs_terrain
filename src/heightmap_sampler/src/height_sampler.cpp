@@ -4,6 +4,8 @@
 
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <mutex>
 #include <utility>
 
@@ -12,6 +14,7 @@
 #include "manifest.hpp"
 #include "tile_cache.hpp"
 #include "tile_grid.hpp"
+#include "wgs_lattice.hpp"
 
 namespace heightmap_sampler
 {
@@ -46,6 +49,82 @@ OGRSpatialReference make_crs(const std::string & definition)
   return crs;
 }
 
+/// The window of \p lattice that \p roi needs, or nothing when \p roi is
+/// inverted, non-finite or off the globe.
+std::optional<PixelWindow> roi_window(const Lattice & lattice, const Roi & roi)
+{
+  const double west = roi.top_left.longitude;
+  const double north = roi.top_left.latitude;
+  const double east = roi.bottom_right.longitude;
+  const double south = roi.bottom_right.latitude;
+  // Written so that NaN fails too.
+  if (!(west >= -180.0 && east <= 180.0 && south >= -90.0 && north <= 90.0)) {
+    return std::nullopt;
+  }
+  return lattice.bilinear_window(west, south, east, north);
+}
+
+GridGeoreference georeference(const Lattice & lattice, const PixelWindow & window)
+{
+  GridGeoreference geo;
+  geo.west = lattice.west_of(window.col_min);
+  geo.north = lattice.north_of(window.row_min);
+  geo.resolution_deg = lattice.resolution_deg;
+  geo.width = static_cast<std::size_t>(window.width);
+  geo.height = static_cast<std::size_t>(window.height);
+  return geo;
+}
+
+/// Where one tile's contribution to a stitched window lies: \p width x
+/// \p height pixels at (\p tile_col, \p tile_row) of the tile's raster go to
+/// (\p out_col, \p out_row) of the output.
+struct TilePiece
+{
+  int tile_col;
+  int tile_row;
+  int width;
+  int height;
+  std::size_t out_col;
+  std::size_t out_row;
+};
+
+/// Hand every piece of \p window to \p read, one tile at a time.  Returns
+/// false as soon as a tile is absent, does not cover its part of the window,
+/// or cannot be read.  Tiles never overlap, so every pixel is read once.
+template<typename Read>
+bool stitch(
+  TileCache & tiles, const Lattice & lattice, const WgsLayer & layer,
+  const PixelWindow & window, Read && read)
+{
+  for (const TileIndex index :
+    tiles_for_window(window, layer.tile_width_px, layer.tile_height_px))
+  {
+    const Tile * tile = tiles.get(index);
+    if (tile == nullptr) {
+      return false;
+    }
+    const std::optional<PixelWindow> placed =
+      lattice.window_of_geotransform(tile->geotransform(), tile->width(), tile->height());
+    // Never empty: the tile was chosen because the window touches it.
+    const std::optional<PixelWindow> needed =
+      intersection(window, tile_window(index, layer.tile_width_px, layer.tile_height_px));
+    if (!placed.has_value() || !needed.has_value() || !placed->contains(*needed)) {
+      return false;
+    }
+    const TilePiece piece{
+      static_cast<int>(needed->col_min - placed->col_min),
+      static_cast<int>(needed->row_min - placed->row_min),
+      static_cast<int>(needed->width),
+      static_cast<int>(needed->height),
+      static_cast<std::size_t>(needed->col_min - window.col_min),
+      static_cast<std::size_t>(needed->row_min - window.row_min)};
+    if (!read(*tile, piece)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 std::filesystem::path default_dataset_dir()
@@ -69,6 +148,15 @@ struct HeightSampler::Impl
     tiles(dataset_dir, manifest.tile_pattern, options.tile_cache_size),
     nodata(static_cast<float>(manifest.nodata))
   {
+    if (manifest.wgs.has_value()) {
+      wgs_height_tiles.emplace(dataset_dir, manifest.wgs->height.tile_pattern,
+        options.tile_cache_size);
+      if (manifest.wgs->rgb.has_value()) {
+        wgs_rgb_tiles.emplace(dataset_dir, manifest.wgs->rgb->tile_pattern,
+          options.tile_cache_size);
+      }
+    }
+
     OGRSpatialReference query_crs = make_crs(kQueryCrs);
     OGRSpatialReference stored_crs = make_crs(manifest.info.horizontal_crs);
     to_stored.reset(OGRCreateCoordinateTransformation(&query_crs, &stored_crs));
@@ -139,9 +227,92 @@ struct HeightSampler::Impl
     return top * (1.0 - fy) + bottom * fy;
   }
 
+  std::optional<HeightGrid> height_grid(const Roi & roi)
+  {
+    if (!manifest.wgs.has_value()) {
+      return std::nullopt;
+    }
+    const WgsManifest & wgs = *manifest.wgs;
+    const Lattice lattice{wgs.origin_lon, wgs.origin_lat, wgs.height.resolution_deg};
+    const std::optional<PixelWindow> window = roi_window(lattice, roi);
+    if (!window.has_value()) {
+      return std::nullopt;
+    }
+
+    HeightGrid grid;
+    grid.geo = georeference(lattice, *window);
+    const std::size_t width = grid.geo.width;
+    grid.heights.resize(width * grid.geo.height);
+
+    const bool complete = stitch(
+      *wgs_height_tiles, lattice, wgs.height, *window,
+      [&](const Tile & tile, const TilePiece & piece) {
+        float * out = grid.heights.data() + piece.out_row * width + piece.out_col;
+        return tile.read_floats(
+          piece.tile_col, piece.tile_row, piece.width, piece.height, out,
+          static_cast<std::ptrdiff_t>(width));
+      });
+    if (!complete) {
+      return std::nullopt;
+    }
+
+    const float wgs_nodata = static_cast<float>(wgs.height_nodata);
+    for (float & height : grid.heights) {
+      if (height == wgs_nodata) {
+        height = std::numeric_limits<float>::quiet_NaN();
+      }
+    }
+    return grid;
+  }
+
+  std::optional<RgbGrid> rgb_grid(const Roi & roi)
+  {
+    if (!manifest.wgs.has_value() || !manifest.wgs->rgb.has_value()) {
+      return std::nullopt;
+    }
+    const WgsManifest & wgs = *manifest.wgs;
+    const Lattice lattice{wgs.origin_lon, wgs.origin_lat, wgs.rgb->resolution_deg};
+    const std::optional<PixelWindow> window = roi_window(lattice, roi);
+    if (!window.has_value()) {
+      return std::nullopt;
+    }
+
+    RgbGrid grid;
+    grid.geo = georeference(lattice, *window);
+    const std::size_t width = grid.geo.width;
+    grid.rgb.resize(3 * width * grid.geo.height);
+    grid.valid.resize(width * grid.geo.height);
+
+    const bool complete = stitch(
+      *wgs_rgb_tiles, lattice, *wgs.rgb, *window,
+      [&](const Tile & tile, const TilePiece & piece) {
+        const std::size_t at = piece.out_row * width + piece.out_col;
+        return tile.read_rgb(
+          piece.tile_col, piece.tile_row, piece.width, piece.height, grid.rgb.data() + 3 * at,
+          static_cast<std::ptrdiff_t>(3 * width)) &&
+               tile.read_mask(
+          piece.tile_col, piece.tile_row, piece.width, piece.height, grid.valid.data() + at,
+          static_cast<std::ptrdiff_t>(width));
+      });
+    if (!complete) {
+      return std::nullopt;
+    }
+
+    // Lossy compression leaves arbitrary values under the mask; report black.
+    for (std::size_t at = 0; at < grid.valid.size(); ++at) {
+      if (grid.valid[at] == 0) {
+        grid.rgb[3 * at] = grid.rgb[3 * at + 1] = grid.rgb[3 * at + 2] = 0;
+      }
+    }
+    return grid;
+  }
+
   std::filesystem::path dataset_dir;
   Manifest manifest;
   TileCache tiles;
+  /// Set when the dataset has EPSG:4326 height (and RGB) tiles.
+  std::optional<TileCache> wgs_height_tiles;
+  std::optional<TileCache> wgs_rgb_tiles;
   float nodata;
   CoordinateTransformationPtr to_stored;
   // Neither OGRCoordinateTransformation nor the tile cache is thread-safe, and
@@ -197,6 +368,37 @@ std::vector<std::optional<double>> HeightSampler::sample(const std::vector<LatLo
     }
   }
   return heights;
+}
+
+std::optional<HeightGrid> HeightSampler::height_grid(const Roi & roi) const
+{
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  try {
+    return impl_->height_grid(roi);
+  } catch (const std::exception &) {
+    // An unreadable tile, or a grid too large to allocate, is no grid.
+    return std::nullopt;
+  }
+}
+
+std::optional<RgbGrid> HeightSampler::rgb_grid(const Roi & roi) const
+{
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  try {
+    return impl_->rgb_grid(roi);
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
+}
+
+bool HeightSampler::has_height_grids() const noexcept
+{
+  return impl_->manifest.wgs.has_value();
+}
+
+bool HeightSampler::has_rgb_grids() const noexcept
+{
+  return impl_->manifest.wgs.has_value() && impl_->manifest.wgs->rgb.has_value();
 }
 
 const DatasetInfo & HeightSampler::info() const noexcept

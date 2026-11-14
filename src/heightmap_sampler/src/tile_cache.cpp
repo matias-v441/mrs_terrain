@@ -29,13 +29,12 @@ Tile::Tile(GDALDataset * dataset, const std::string & path)
   width_ = dataset_->GetRasterXSize();
   height_ = dataset_->GetRasterYSize();
 
-  double transform[6];
-  if (dataset_->GetGeoTransform(transform) != CE_None) {
+  if (dataset_->GetGeoTransform(transform_) != CE_None) {
     GDALClose(dataset_);
     dataset_ = nullptr;
     throw DatasetError("tile " + path_ + " has no geotransform");
   }
-  if (!GDALInvGeoTransform(transform, inv_transform_)) {
+  if (!GDALInvGeoTransform(transform_, inv_transform_)) {
     GDALClose(dataset_);
     dataset_ = nullptr;
     throw DatasetError("tile " + path_ + " has a non-invertible geotransform");
@@ -79,6 +78,51 @@ std::optional<float> Tile::value_at(double x, double y) const
     return std::nullopt;
   }
   return value;
+}
+
+bool Tile::read_floats(
+  int col, int row, int width, int height, float * out, std::ptrdiff_t line_stride) const
+{
+  GDALRasterBand * band = dataset_->GetRasterBand(1);
+  return band->RasterIO(
+    GF_Read, col, row, width, height, out, width, height, GDT_Float32,
+    sizeof(float), static_cast<GSpacing>(line_stride) * sizeof(float), nullptr) == CE_None;
+}
+
+bool Tile::read_rgb(
+  int col, int row, int width, int height, std::uint8_t * out, std::ptrdiff_t line_stride) const
+{
+  if (dataset_->GetRasterCount() < 3) {
+    return false;
+  }
+  int bands[3] = {1, 2, 3};
+  return dataset_->RasterIO(
+    GF_Read, col, row, width, height, out, width, height, GDT_Byte, 3, bands,
+    3, static_cast<GSpacing>(line_stride), 1, nullptr) == CE_None;
+}
+
+bool Tile::read_mask(
+  int col, int row, int width, int height, std::uint8_t * out, std::ptrdiff_t line_stride) const
+{
+  GDALRasterBand * mask = dataset_->GetRasterBand(1)->GetMaskBand();
+  if (mask == nullptr) {
+    return false;
+  }
+  if (mask->RasterIO(
+      GF_Read, col, row, width, height, out, width, height, GDT_Byte,
+      1, static_cast<GSpacing>(line_stride), nullptr) != CE_None)
+  {
+    return false;
+  }
+  // GDAL mask bands are 0 or 255 by convention, but nothing forces a file's
+  // internal mask to follow it.
+  for (int r = 0; r < height; ++r) {
+    std::uint8_t * line = out + static_cast<std::ptrdiff_t>(r) * line_stride;
+    for (int c = 0; c < width; ++c) {
+      line[c] = line[c] != 0 ? 255 : 0;
+    }
+  }
+  return true;
 }
 
 TileCache::TileCache(std::filesystem::path root, std::string tile_pattern, std::size_t capacity)

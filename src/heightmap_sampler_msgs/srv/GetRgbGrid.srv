@@ -1,0 +1,27 @@
+# Read the orthophoto over a region of interest, stitched from the dataset's
+# EPSG:4326 RGB tiles.
+#
+# The region is an axis-aligned WGS84 rectangle: min_pt is its south-west
+# corner and max_pt its north-east corner.  Altitudes are ignored.
+geographic_msgs/BoundingBox roi
+---
+# False when the region is invalid (inverted, or off the globe), when a tile it
+# needs is absent from the dataset, or when the dataset holds no imagery;
+# message then says why.  Pixels without imagery do not make a request fail:
+# they are transparent in the grid.
+bool success
+string message
+
+# Where the grid lies, in EPSG:4326 degrees: the west and north edges of the
+# whole grid (the outer corner of pixel (0, 0)), and the size of a pixel along
+# both axes.  Each pixel's value belongs to its centre.
+float64 west
+float64 north
+float64 resolution_deg
+
+# Row 0 is northmost, columns run east; encoding rgba8.  Alpha is 255 where
+# there is imagery and 0 where there is none.
+#
+# The grid holds exactly the pixels that bilinear interpolation between pixel
+# centres reads for some point of the region, on the RGB lattice.
+sensor_msgs/Image grid

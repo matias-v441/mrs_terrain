@@ -37,3 +37,41 @@ tiles:
     - 0
   - - 0
     - 1
+wgs:
+  crs: EPSG:4326
+  lattice_origin_lon: -180.0
+  lattice_origin_lat: 90.0
+  resolution_deg: 3.814697265625e-06
+  tile_size_px: 32
+  tile_span_deg: 0.0001220703125
+  height:
+    resolution_deg: 1.52587890625e-05
+    height_factor: 4
+    tile_width_px: 8
+    tile_height_px: 8
+    tile_pattern: wgs/height/tile_{ix}_{iy}.tif
+    dtype: float32
+    unit: m
+    nodata: -9999.0
+    vertical_crs: EPSG:5773
+    vertical_datum: egm96
+  rgb:
+    resolution_deg: 3.814697265625e-06
+    tile_width_px: 32
+    tile_height_px: 32
+    tile_pattern: wgs/rgb/tile_{ix}_{iy}.tif
+    bands:
+    - red
+    - green
+    - blue
+    dtype: uint8
+    mask: internal
+  tiles:
+    count: 3
+    index:
+    - - 1591393
+      - 332901
+    - - 1591394
+      - 332901
+    - - 1591393
+      - 332902

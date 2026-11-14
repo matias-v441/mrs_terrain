@@ -29,6 +29,45 @@ if (auto height = sampler.sample(49.3625695, 14.2619165)) {
 
 `sample` takes **latitude first**, never throws, and is safe to call from
 several threads. There is a batch overload taking a `std::vector<LatLon>`.
+
+### Regions of interest
+
+`height_grid` and `rgb_grid` return a whole region as one stitched buffer:
+
+```cpp
+// An axis-aligned WGS84 rectangle: north-west corner, then south-east corner.
+heightmap_sampler::Roi roi{{49.3630, 14.2610}, {49.3620, 14.2625}};
+
+if (auto grid = sampler.height_grid(roi)) {
+  // grid->heights: row-major float, row 0 northmost, NaN where there is no height
+  // grid->geo: west/north edges, resolution_deg, width, height (EPSG:4326)
+}
+if (auto image = sampler.rgb_grid(roi)) {
+  // image->rgb: row-major interleaved RGB; image->valid: 255 imagery / 0 none
+}
+```
+
+They read the dataset's EPSG:4326 tiles (see [the dataset](#the-dataset)), on
+which a latitude/longitude rectangle is axis-aligned. The grid holds exactly
+the pixels that bilinear interpolation between pixel centres reads for some
+point of the region. So every point of the region, the two corners included,
+can be interpolated from the grid alone. On a lattice of pixel size `r` from
+`(lon0, lat0)`, with `c(lon) = (lon - lon0) / r - 0.5` and
+`r(lat) = (lat0 - lat) / r - 0.5`, the grid holds columns
+`floor(c(west)) .. floor(c(east)) + 1` and rows `floor(r(north)) .. floor(r(south)) + 1`.
+A single point gives a 2x2 grid. Imagery comes on its own, finer lattice by the
+same rule.
+
+The two calls return nothing when a tile the region needs is absent, and when
+the region is inverted or off the globe. Pixels without data inside the
+available tiles do not count as missing tiles: they come back as NaN or with
+`valid` 0. Like `sample`, both calls never throw and are thread-safe.
+`has_height_grids()` and `has_rgb_grids()` report whether the dataset holds
+these tiles at all.
+
+The EPSG:4326 heights are themselves bilinear samples of the EPSG:5514 tiles,
+taken at each pixel centre. So interpolating a grid gives a close
+approximation of `sample`, not the same value.
 `info()` reports what the manifest says the returned values are, so a consumer
 can assert the vertical datum it expects rather than assuming one.
 
@@ -56,9 +95,9 @@ repository's `worlds/`, with heights on the WGS84 ellipsoid. After changing
 those worlds, run `./regenerate.sh` from the repository root and commit
 `dataset/`.
 
-The sampler reads only the EPSG:5514 tiles under `height/`. The dataset also
-carries EPSG:4326 WGS tiles of heights and orthophoto imagery under `wgs/`, and
-a worlds database; they are installed with it but not read by this package.
+Point samples read the EPSG:5514 tiles under `height/`. Region grids read the
+EPSG:4326 WGS tiles of heights and orthophoto imagery under `wgs/`. The worlds
+database is installed with the dataset but not read by this package.
 `dataset.yaml` must be of format version 2.
 
 To bundle a different dataset instead, point the build at it:
@@ -93,12 +132,32 @@ heights=[405.6511035203645], valid=[True], success=True, message=''
 ```
 
 `valid[i]` is false, and `heights[i]` NaN, where there is no prepared height;
-that is a normal answer, so `success` stays true. Parameters:
+that is a normal answer, so `success` stays true.
+
+Regions come from `heightmap_sampler_msgs/srv/GetHeightGrid` and
+`GetRgbGrid`. Each takes a `geographic_msgs/BoundingBox` whose `min_pt` is the
+south-west corner and `max_pt` the north-east corner:
+
+```bash
+ros2 service call /heightmap_sampler/get_height_grid \
+  heightmap_sampler_msgs/srv/GetHeightGrid \
+  "{roi: {min_pt: {latitude: 49.3620, longitude: 14.2610}, max_pt: {latitude: 49.3630, longitude: 14.2625}}}"
+```
+
+The response carries a `sensor_msgs/Image` grid with row 0 northmost. Heights
+are `32FC1`, with NaN where there is no height. Imagery is `rgba8`, with alpha
+0 where there is none. The response also gives the grid's `west` and `north`
+edges and its `resolution_deg`. `success` is false, with a reason in
+`message`, when the library returns nothing.
+
+Parameters:
 
 | parameter | default | meaning |
 | --- | --- | --- |
 | `dataset_dir` | `""` | Dataset to sample; empty means the bundled one. |
 | `service_name` | `~/sample_height` | |
+| `height_grid_service_name` | `~/get_height_grid` | |
+| `rgb_grid_service_name` | `~/get_rgb_grid` | |
 | `tile_cache_size` | `16` | How many tile rasters to keep open at once. |
 
 The node is also registered as an `rclcpp_components` component,
@@ -117,7 +176,8 @@ colcon test-result --verbose
 `test_bundled_dataset` checks the bundled dataset: every reference height in
 its `test_points.csv`, which heightmap-prep computes at each safety area corner,
 must come out of this library, both from the dataset directory and from a
-default-constructed sampler reading the installed copy.
+default-constructed sampler reading the installed copy. It also checks that
+there are height and imagery grids around each of those corners.
 
 The remaining unit tests run against a committed synthetic fixture in `test/data`, whose
 surface is a plane — bilinear interpolation of a plane is exact, so every
@@ -125,6 +185,11 @@ expected value is closed form. `test/make_fixture.py` regenerates it, including
 the expected heights, which it derives with pyproj in the same direction the
 sampler transforms; a passing test therefore also confirms that GDAL's
 `EPSG:4326 -> EPSG:5514` transformation agrees with pyproj's.
+
+The fixture also holds small EPSG:4326 tiles on power-of-two degree lattices:
+a height plane with a NoData patch, and an imagery pattern with a masked patch.
+One of the four tiles is absent. `test_roi` reads region grids from them, and
+`test_wgs_lattice` checks the grid-extent rule on its own.
 
 The parity check against the Python reference needs the project's Python
 environment, so it lives outside the colcon test set; `test_sampler.sh` runs it
